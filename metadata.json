@@ -1,0 +1,6 @@
+{
+  "name": "Solana Sniper Bot - Python Live & Paper Engine",
+  "description": "Pure Python multi-source Solana new-launch sniper with real-time WebSocket streaming and Phantom browser-once live automation.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

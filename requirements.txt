@@ -1,0 +1,6 @@
+# Optional performance & full Playwright browser automation packages.
+# Note: All core bot, WebSocket streaming, CDP browser automation, and web dashboard
+# modules also run cleanly on Python 3.10+ stdlib with zero external dependencies.
+requests>=2.31.0
+playwright>=1.45.0
+websockets>=12.0

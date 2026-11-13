@@ -1,0 +1,17 @@
+node_modules/
+build/
+dist/
+coverage/
+.DS_Store
+*.log
+.env*
+!.env.example
+__pycache__/
+*.pyc
+phantom_profile/
+state.json
+live_state.json
+settings.json
+trades.csv
+live_trades.csv
+.playwright-cli/
