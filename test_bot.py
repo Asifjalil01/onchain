@@ -237,5 +237,75 @@ class TestSettingsAndWebDashboard(unittest.TestCase):
         self.assertTrue(json.loads(resp_raw)["ok"])
 
 
+class TestExistingChromeRelayAndGuiImports(unittest.TestCase):
+    def test_chrome_profile_discovery_from_local_state(self):
+        tmpdir = tempfile.mkdtemp()
+        try:
+            with open(os.path.join(tmpdir, "Local State"), "w", encoding="utf-8") as f:
+                json.dump({
+                    "profile": {
+                        "info_cache": {
+                            "Default": {"name": "Personal"},
+                            "Profile 1": {"name": "Trading"},
+                        }
+                    }
+                }, f)
+            profs = phantom_bridge.list_chrome_profiles(user_data_dir=tmpdir)
+            self.assertEqual([p["dir"] for p in profs], ["Default", "Profile 1"])
+            self.assertEqual(profs[1]["name"], "Trading")
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_local_phantom_relay_connect_and_sign_roundtrip(self):
+        tmpdir = tempfile.mkdtemp()
+        bridge = phantom_bridge.PhantomBrowserBridge(profile_dir=tmpdir, connection_mode="existing_chrome")
+        try:
+            url = bridge._relay.url()
+            base = url.rsplit("/", 1)[0]
+
+            # Simulate existing Chrome tab reporting connected Phantom wallet
+            req = urllib.request.Request(
+                f"{base}/api/relay/connected",
+                data=json.dumps({"publicKey": "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d"}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=4) as r:
+                self.assertEqual(r.status, 200)
+            self.assertTrue(bridge.connected_once)
+            self.assertEqual(bridge.status, "connected")
+
+            # Simulate signing job submitted by Python & completed by existing Chrome tab
+            def simulate_browser_tab():
+                time.sleep(0.15)
+                with urllib.request.urlopen(f"{base}/api/relay/next", timeout=4) as r:
+                    job = json.loads(r.read().decode("utf-8"))
+                self.assertIn("id", job)
+                res_req = urllib.request.Request(
+                    f"{base}/api/relay/result",
+                    data=json.dumps({"id": job["id"], "ok": True, "signature": "5TestRelaySigXYZ"}).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                urllib.request.urlopen(res_req, timeout=4).close()
+
+            t = threading.Thread(target=simulate_browser_tab, daemon=True)
+            t.start()
+            sig, err = bridge._relay.submit_sign_job("AQAB", side="BUY", timeout_sec=5.0)
+            self.assertIsNone(err)
+            self.assertEqual(sig, "5TestRelaySigXYZ")
+        finally:
+            bridge.close()
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_gui_module_has_required_imports(self):
+        import gui
+        self.assertTrue(hasattr(gui, "os"))
+        self.assertTrue(hasattr(gui, "time"))
+        self.assertTrue(hasattr(gui, "bot"))
+        self.assertTrue(hasattr(gui, "App"))
+
+
 if __name__ == "__main__":
     unittest.main()
+

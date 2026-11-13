@@ -473,10 +473,24 @@ def _build_html():
       <section id="tab-phantom" class="panel" role="tabpanel">
         <div class="phantom-grid">
           <div class="subcard">
-            <h2>Browser-Once Phantom Setup</h2>
+            <h2>Browser-Once Phantom Setup (Existing Chrome)</h2>
             <p style="color:var(--muted); font-size:12.5px; margin-top:0;">
-              Connect Phantom once inside the persistent browser profile. Your unlock &amp; dApp trust persist across restarts so Live Mode swaps confirm automatically.
+              Connects to your already-open Chrome browser &amp; profile where Phantom is unlocked (no brand-new profile or external redirect). Keep the local bridge tab open for Live Mode swaps.
             </p>
+            <div class="field">
+              <label for="ph-conn-mode">Connection Mode</label>
+              <select id="ph-conn-mode">
+                <option value="existing_chrome">existing_chrome (Use Already-Open Chrome &amp; Profile)</option>
+                <option value="cdp_attach">cdp_attach (Attach to Chrome --remote-debugging-port)</option>
+                <option value="isolated_profile">isolated_profile (Separate phantom_profile/)</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="ph-chrome-profile">Existing Chrome Profile</label>
+              <select id="ph-chrome-profile">
+                <option value="Default">Default</option>
+              </select>
+            </div>
             <div class="field">
               <label for="ph-wallet-hint">Wallet Public Key (auto-detected from Phantom, or enter manually for RPC/quote binding)</label>
               <input id="ph-wallet-hint" type="text" placeholder="Optional Solana address (base58)" />
@@ -484,7 +498,7 @@ def _build_html():
             <div class="controls">
               <button type="button" class="accent" onclick="connectPhantomOnce()">Connect Phantom (Once)</button>
               <button type="button" onclick="postAction('/api/phantom/refresh')">Refresh SOL Balance</button>
-              <button type="button" onclick="postAction('/api/phantom/close')">Close Browser Window</button>
+              <button type="button" onclick="postAction('/api/phantom/close')">Close Bridge</button>
             </div>
           </div>
           <div class="subcard">
@@ -612,8 +626,12 @@ def _build_html():
 
     function connectPhantomOnce() {{
       const hint = (document.getElementById('ph-wallet-hint').value || '').trim();
-      showToast('Launching persistent Phantom browser session...');
-      postAction('/api/phantom/connect', {{ wallet_hint: hint }});
+      const modeEl = document.getElementById('ph-conn-mode');
+      const profEl = document.getElementById('ph-chrome-profile');
+      const connection_mode = modeEl ? modeEl.value : 'existing_chrome';
+      const chrome_profile = profEl ? profEl.value : 'Default';
+      showToast(`Opening Phantom bridge in Chrome (${{chrome_profile}})...`);
+      postAction('/api/phantom/connect', {{ wallet_hint: hint, connection_mode, chrome_profile }});
     }}
 
     function requestReset() {{
@@ -780,14 +798,27 @@ def _build_html():
         </tr>`;
       }}).join('') : '<tr><td colspan="7" class="empty-row">Waiting for real-time stream events...</td></tr>';
 
-      // Phantom Diagnostics
+      // Phantom Diagnostics + Profile Options
+      const profSelect = document.getElementById('ph-chrome-profile');
+      if (profSelect && Array.isArray(s.chrome_profiles) && profSelect.options.length <= 1) {{
+        const curVal = ph.chrome_profile || 'Default';
+        profSelect.innerHTML = s.chrome_profiles.map(p =>
+          `<option value="${{esc(p.dir)}}">${{esc(p.name)}} (${{esc(p.dir)}})</option>`
+        ).join('');
+        profSelect.value = curVal;
+      }}
+      const modeSelect = document.getElementById('ph-conn-mode');
+      if (modeSelect && ph.connection_mode && document.activeElement !== modeSelect) {{
+        modeSelect.value = ph.connection_mode;
+      }}
       document.getElementById('phantom-kv').innerHTML = [
         ['Status', ph.status],
         ['Connected Once', String(ph.connected_once)],
         ['Wallet Address', ph.wallet_address || '(none)'],
         ['SOL Balance', `${{Number(ph.sol_balance || 0).toFixed(6)}} SOL`],
-        ['Driver', `${{ph.driver}} (browser_active=${{ph.browser_active}})`],
-        ['Profile Dir', ph.profile_dir],
+        ['Connection Mode', `${{ph.connection_mode}} (profile=${{ph.chrome_profile}})`],
+        ['Driver', `${{ph.driver}} (relay_alive=${{ph.relay_tab_alive}}, active=${{ph.browser_active}})`],
+        ['Relay URL', ph.relay_url || '(starts on connect)'],
         ['Extension Found', `${{ph.extension_detected}} (${{ph.extension_path || 'auto'}})`],
         ['Chromium Found', `${{ph.chromium_detected}} (${{ph.chromium_path || 'not found'}})`],
         ['Last Tx Sig', ph.last_tx_sig || '-'],
@@ -923,7 +954,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
         if path == "/api/phantom/connect":
             hint = str(body.get("wallet_hint") or "").strip()
-            ok, msg = eng.connect_phantom_once(wallet_hint=hint)
+            prof = str(body.get("chrome_profile") or "").strip() or None
+            mode = str(body.get("connection_mode") or "").strip() or None
+            ok, msg = eng.connect_phantom_once(wallet_hint=hint, chrome_profile=prof, connection_mode=mode)
             self._send_json({"ok": ok, "message": msg, "phantom": eng.bridge.get_status()}, status=200 if ok else 400)
             return
 

@@ -12,7 +12,7 @@ from collections import deque
 from datetime import datetime
 
 import bot
-from phantom_bridge import PhantomBrowserBridge
+from phantom_bridge import PhantomBrowserBridge, list_chrome_profiles
 from realtime_stream import RealtimeStreamManager
 
 SETTINGS_FILE = "settings.json"
@@ -21,7 +21,10 @@ SETTINGS = [
     ("live_trade_size_sol", "Live trade size (SOL)", "float"),
     ("live_max_sol_per_trade", "Live safety cap (max SOL/trade)", "float"),
     ("live_dry_run", "Live dry-run (quote only, no Phantom tx)", "bool"),
-    ("phantom_profile_dir", "Phantom browser profile folder", "str"),
+    ("phantom_connection_mode", "Phantom mode ('existing_chrome', 'cdp_attach', 'isolated_profile')", "str"),
+    ("phantom_chrome_profile", "Existing Chrome profile (e.g. Default, Profile 1)", "str"),
+    ("phantom_cdp_port", "Chrome CDP port (for auto-confirm attach)", "int"),
+    ("phantom_profile_dir", "Session/isolated profile folder", "str"),
     ("phantom_extension_path", "Phantom unpacked extension path (optional)", "str"),
     ("phantom_auto_confirm", "Auto-confirm Phantom swap popup", "bool"),
     ("start_balance_usd", "Start balance $ (used on reset)", "float"),
@@ -62,6 +65,7 @@ SETTINGS = [
 LIMITS = {
     "live_trade_size_sol": (0.001, 50.0),
     "live_max_sol_per_trade": (0.001, 100.0),
+    "phantom_cdp_port": (1024, 65535),
     "start_balance_usd": (1, 1e7),
     "trade_size_usd": (0.5, 1e6),
     "max_open_positions": (1, 50),
@@ -114,6 +118,11 @@ def parse_settings(raw):
             val = val.lower()
             if val not in ("paper", "live"):
                 errors.append(f"{label}: must be 'paper' or 'live'")
+                continue
+        elif key == "phantom_connection_mode":
+            val = val.lower()
+            if val not in ("existing_chrome", "cdp_attach", "isolated_profile"):
+                errors.append(f"{label}: must be 'existing_chrome', 'cdp_attach', or 'isolated_profile'")
                 continue
         elif key == "phantom_profile_dir" and not val:
             errors.append(f"{label}: cannot be empty")
@@ -264,6 +273,9 @@ class SniperEngine:
             auto_confirm=bot.CONFIG.get("phantom_auto_confirm", True),
             rpc_urls=bot.RPC_URLS,
             jupiter_api_key=bot.CONFIG.get("jupiter_api_key", ""),
+            connection_mode=bot.CONFIG.get("phantom_connection_mode", "existing_chrome"),
+            chrome_profile=bot.CONFIG.get("phantom_chrome_profile", "Default"),
+            cdp_port=bot.CONFIG.get("phantom_cdp_port", 9222),
             log_fn=self._emit_log,
         )
         self.mode = bot.CONFIG.get("trading_mode", "paper")
@@ -316,10 +328,19 @@ class SniperEngine:
             bot.log("Switched to PAPER MODE (safe simulated funds).")
         return True, f"Active mode: {mode.upper()}"
 
-    def connect_phantom_once(self, wallet_hint=""):
+    def connect_phantom_once(self, wallet_hint="", chrome_profile=None, connection_mode=None):
+        if chrome_profile:
+            bot.CONFIG["phantom_chrome_profile"] = chrome_profile
+        if connection_mode:
+            bot.CONFIG["phantom_connection_mode"] = connection_mode
+        if chrome_profile or connection_mode:
+            save_settings()
         self.bridge.profile_dir = os.path.abspath(bot.CONFIG.get("phantom_profile_dir", "phantom_profile"))
         self.bridge.extension_path = bot.CONFIG.get("phantom_extension_path", "")
         self.bridge.auto_confirm = bool(bot.CONFIG.get("phantom_auto_confirm", True))
+        self.bridge.connection_mode = bot.CONFIG.get("phantom_connection_mode", "existing_chrome")
+        self.bridge.chrome_profile = bot.CONFIG.get("phantom_chrome_profile", "Default")
+        self.bridge.cdp_port = int(bot.CONFIG.get("phantom_cdp_port", 9222))
         ok, msg = self.bridge.connect_once(wallet_hint=wallet_hint)
         if ok:
             self.live_acct.sync_wallet_cash()
@@ -447,6 +468,7 @@ class SniperEngine:
             "stream": self.stream_mgr.get_stats(),
             "stream_events": self.stream_mgr.get_recent_events(limit=60),
             "phantom": self.bridge.get_status(),
+            "chrome_profiles": list_chrome_profiles(),
             "logs": self.get_logs(limit=150),
             "config": {k: bot.CONFIG[k] for k, _, _ in SETTINGS},
         }

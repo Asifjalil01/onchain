@@ -37,6 +37,9 @@ CONFIG = {
     "live_trade_size_sol": 0.05,
     "live_max_sol_per_trade": 0.25,
     "live_dry_run": False,
+    "phantom_connection_mode": "existing_chrome",  # "existing_chrome" | "cdp_attach" | "isolated_profile"
+    "phantom_chrome_profile": "Default",
+    "phantom_cdp_port": 9222,
     "phantom_profile_dir": "phantom_profile",
     "phantom_extension_path": "",
     "phantom_auto_confirm": True,
@@ -945,6 +948,9 @@ def run(once=False, live=False):
             auto_confirm=CONFIG.get("phantom_auto_confirm", True),
             rpc_urls=RPC_URLS,
             jupiter_api_key=CONFIG.get("jupiter_api_key", ""),
+            connection_mode=CONFIG.get("phantom_connection_mode", "existing_chrome"),
+            chrome_profile=CONFIG.get("phantom_chrome_profile", "Default"),
+            cdp_port=CONFIG.get("phantom_cdp_port", 9222),
             log_fn=log,
         )
         if not bridge.connected_once:

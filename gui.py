@@ -5,6 +5,7 @@ Supports:
 - Paper Mode (safe simulation) & Live Mode (Phantom Browser-Once automation)
 - Real-Time WebSocket Data Streaming (PumpPortal WS + Solana RPC logsSubscribe)
 """
+import os
 import queue
 import sys
 import threading
@@ -18,6 +19,7 @@ except ImportError:
     tk = ttk = messagebox = None
 
 import bot
+from phantom_bridge import list_chrome_profiles
 from engine import (
     SETTINGS,
     SniperEngine,
@@ -231,14 +233,31 @@ class App:
     def build_phantom_tab(self, parent):
         box = tk.Frame(parent, bg=CARD, highlightbackground=LINE, highlightthickness=1)
         box.pack(fill="x", padx=10, pady=12)
-        tk.Label(box, text="Phantom Wallet Browser-Once Automation", bg=CARD, fg="#101828", font=("Segoe UI", 13, "bold")).pack(anchor="w", padx=14, pady=(12, 4))
+        tk.Label(box, text="Phantom Wallet Browser-Once Automation (Existing Chrome Profile)", bg=CARD, fg="#101828", font=("Segoe UI", 13, "bold")).pack(anchor="w", padx=14, pady=(12, 4))
         tk.Label(
             box,
-            text="1) Click 'Connect Phantom (Once)' to open the persistent browser profile (`phantom_profile/`).\n"
-                 "2) Unlock Phantom and approve the connection ONCE. Your session persists for automated Live Mode swaps.\n"
-                 "3) Switch Trading Mode to LIVE when ready. Enable 'Live dry-run' in Settings to test quotes without spending SOL.",
+            text="1) Select your existing Chrome profile where Phantom is already unlocked (no new browser profile needed).\n"
+                 "2) Click 'Connect Phantom (Once)' — it opens a local bridge tab inside your ALREADY-OPEN Chrome browser.\n"
+                 "3) Approve 'Connect' once in Phantom and keep that bridge tab open for Live Mode swaps.",
             bg=CARD, fg=GREY, justify="left", font=("Segoe UI", 9),
         ).pack(anchor="w", padx=14, pady=(0, 10))
+
+        pick = tk.Frame(box, bg=CARD)
+        pick.pack(fill="x", padx=14, pady=(0, 10))
+        tk.Label(pick, text="Connection mode:", bg=CARD, font=("Segoe UI", 9, "bold")).pack(side="left")
+        self.ph_mode_var = tk.StringVar(value=bot.CONFIG.get("phantom_connection_mode", "existing_chrome"))
+        ttk.Combobox(
+            pick, textvariable=self.ph_mode_var, width=16, state="readonly",
+            values=("existing_chrome", "cdp_attach", "isolated_profile"),
+        ).pack(side="left", padx=(6, 16))
+
+        tk.Label(pick, text="Chrome profile:", bg=CARD, font=("Segoe UI", 9, "bold")).pack(side="left")
+        profs = [p["dir"] for p in list_chrome_profiles()]
+        cur_prof = bot.CONFIG.get("phantom_chrome_profile", "Default")
+        if cur_prof not in profs:
+            profs.insert(0, cur_prof)
+        self.ph_profile_var = tk.StringVar(value=cur_prof)
+        ttk.Combobox(pick, textvariable=self.ph_profile_var, width=18, values=profs).pack(side="left", padx=(6, 16))
 
         self.ph_detail = tk.Label(box, text="", bg=CARD, fg="#101828", justify="left", font=("Consolas", 9))
         self.ph_detail.pack(anchor="w", padx=14, pady=(0, 10))
@@ -247,7 +266,7 @@ class App:
         row.pack(fill="x", padx=14, pady=(0, 12))
         ttk.Button(row, text="Connect Phantom (Once)", command=self.connect_phantom).pack(side="left")
         ttk.Button(row, text="Refresh SOL Balance", command=self.refresh_phantom).pack(side="left", padx=8)
-        ttk.Button(row, text="Close Browser Window", command=self.engine.close_phantom_browser).pack(side="left")
+        ttk.Button(row, text="Close Bridge", command=self.engine.close_phantom_browser).pack(side="left")
 
     def build_settings(self, parent):
         canvas = tk.Canvas(parent, bg=BG, highlightthickness=0)
@@ -321,9 +340,11 @@ class App:
         self.say(msg)
 
     def connect_phantom(self):
-        self.say("Opening persistent Phantom browser...")
+        prof = self.ph_profile_var.get().strip() or bot.CONFIG.get("phantom_chrome_profile", "Default")
+        mode = self.ph_mode_var.get().strip() or bot.CONFIG.get("phantom_connection_mode", "existing_chrome")
+        self.say(f"Opening Phantom bridge in Chrome ({prof})...")
         def worker():
-            ok, msg = self.engine.connect_phantom_once()
+            ok, msg = self.engine.connect_phantom_once(chrome_profile=prof, connection_mode=mode)
             self.root.after(0, lambda: self.say(msg, 6000))
         threading.Thread(target=worker, daemon=True).start()
 
@@ -484,8 +505,9 @@ class App:
                 f"Connected once:  {ph['connected_once']}\n"
                 f"Wallet address:  {ph['wallet_address'] or '(none yet)'}\n"
                 f"SOL balance:     {ph['sol_balance']:.6f} SOL\n"
-                f"Browser driver:  {ph['driver']} (active={ph['browser_active']})\n"
-                f"Profile dir:     {ph['profile_dir']}\n"
+                f"Mode / Profile:  {ph['connection_mode']} (Chrome profile='{ph['chrome_profile']}')\n"
+                f"Bridge driver:   {ph['driver']} (relay_alive={ph.get('relay_tab_alive')}, active={ph['browser_active']})\n"
+                f"Relay URL:       {ph.get('relay_url') or '(starts on connect)'}\n"
                 f"Extension found: {ph['extension_detected']} ({ph['extension_path'] or 'auto'})\n"
                 f"Last tx sig:     {ph['last_tx_sig'] or '-'}\n"
                 f"Last message:    {ph['last_error'] or 'OK'}"
