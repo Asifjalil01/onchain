@@ -54,6 +54,7 @@ def _build_html():
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Solana Sniper Bot - Python Live &amp; Paper Engine</title>
+  <script src="https://unpkg.com/@solana/web3.js@1.95.8/lib/index.iife.min.js" defer></script>
   <style>
     :root {{
       --bg: #0b0f17;
@@ -393,7 +394,8 @@ def _build_html():
       </div>
       <div class="controls">
         <button id="btn-mode" type="button" onclick="requestModeToggle()">Switch to Live Mode</button>
-        <button id="btn-phantom-top" type="button" class="accent" onclick="connectPhantomOnce()">Connect Phantom (Once)</button>
+        <button id="btn-phantom-top" type="button" class="accent" onclick="connectPhantomBrowser()">Connect Phantom Wallet</button>
+        <button id="btn-phantom-disc" type="button" onclick="disconnectPhantomBrowser()" style="display:none;">Disconnect</button>
         <button id="btn-start-stop" type="button" class="primary-start" onclick="toggleBot()">Start Bot</button>
       </div>
     </header>
@@ -407,7 +409,7 @@ def _build_html():
       <div class="telemetry-group">
         <span><strong>Phantom:</strong> <span id="phantom-top-status">disconnected</span></span>
         <span><strong>Wallet:</strong> <span id="phantom-top-addr" class="mono">none</span></span>
-        <span><strong>Balance:</strong> <span id="phantom-top-sol">0.0000 SOL</span></span>
+        <span><strong>Balance:</strong> <span id="phantom-top-sol">0.0000 SOL ($0.00)</span></span>
       </div>
     </section>
 
@@ -473,12 +475,12 @@ def _build_html():
       <section id="tab-phantom" class="panel" role="tabpanel">
         <div class="phantom-grid">
           <div class="subcard">
-            <h2>Browser-Once Phantom Setup (Existing Chrome)</h2>
+            <h2>Phantom Wallet Live Connection &amp; Signing</h2>
             <p style="color:var(--muted); font-size:12.5px; margin-top:0;">
-              Connects to your already-open Chrome browser &amp; profile where Phantom is unlocked (no brand-new profile or external redirect). Keep the local bridge tab open for Live Mode swaps.
+              Detects <span class="mono">window.phantom?.solana || window.solana</span> directly in this browser tab (auto-reconnects if trusted) or opens your existing Chrome profile bridge. Zero private keys or seed phrases are ever requested or stored.
             </p>
             <div class="field">
-              <label for="ph-conn-mode">Connection Mode</label>
+              <label for="ph-conn-mode">Fallback Desktop Bridge Mode</label>
               <select id="ph-conn-mode">
                 <option value="existing_chrome">existing_chrome (Use Already-Open Chrome &amp; Profile)</option>
                 <option value="cdp_attach">cdp_attach (Attach to Chrome --remote-debugging-port)</option>
@@ -492,17 +494,18 @@ def _build_html():
               </select>
             </div>
             <div class="field">
-              <label for="ph-wallet-hint">Wallet Public Key (auto-detected from Phantom, or enter manually for RPC/quote binding)</label>
+              <label for="ph-wallet-hint">Read-Only Address Binding (optional; read-only wallets cannot sign live swaps)</label>
               <input id="ph-wallet-hint" type="text" placeholder="Optional Solana address (base58)" />
             </div>
             <div class="controls">
-              <button type="button" class="accent" onclick="connectPhantomOnce()">Connect Phantom (Once)</button>
-              <button type="button" onclick="postAction('/api/phantom/refresh')">Refresh SOL Balance</button>
-              <button type="button" onclick="postAction('/api/phantom/close')">Close Bridge</button>
+              <button type="button" class="accent" onclick="connectPhantomBrowser()">Connect Phantom Wallet</button>
+              <button type="button" onclick="connectPhantomOnce()">Open Chrome Relay Tab</button>
+              <button type="button" onclick="refreshWalletBalance()">Refresh Balance</button>
+              <button type="button" class="warn" onclick="disconnectPhantomBrowser()">Disconnect</button>
             </div>
           </div>
           <div class="subcard">
-            <h2>Phantom Bridge Diagnostics</h2>
+            <h2>Phantom &amp; Safety Diagnostics</h2>
             <div class="kv" id="phantom-kv"></div>
           </div>
         </div>
@@ -545,6 +548,14 @@ def _build_html():
   <dialog id="confirm-dialog" aria-labelledby="dlg-title">
     <h3 id="dlg-title">Confirm action</h3>
     <p id="dlg-body"></p>
+    <div id="dlg-input-wrap" class="field" style="display:none;">
+      <label for="dlg-confirm-input">Type <strong style="color:var(--amber);">ENABLE LIVE</strong> to unlock real swaps</label>
+      <input id="dlg-confirm-input" type="text" autocomplete="off" placeholder="ENABLE LIVE" />
+    </div>
+    <div id="dlg-link-wrap" style="display:none; margin-bottom:14px;">
+      <a id="dlg-ext-link" href="https://phantom.app/" target="_blank" rel="noopener noreferrer" style="color:var(--blue); font-weight:600; text-decoration:underline;">Open https://phantom.app/ to install Phantom &rarr;</a>
+    </div>
+    <div id="dlg-error" style="color:var(--red); font-size:12.5px; margin-bottom:10px; display:none;"></div>
     <div class="dialog-actions">
       <button type="button" onclick="closeDialog()">Cancel</button>
       <button id="dlg-confirm-btn" type="button" class="warn">Confirm</button>
@@ -553,9 +564,16 @@ def _build_html():
 
   <script>
     const SETTINGS_SCHEMA = {settings_schema};
+    const FALLBACK_RPCS = [
+      'https://api.mainnet-beta.solana.com',
+      'https://rpc.ankr.com/solana',
+      'https://solana-rpc.publicnode.com'
+    ];
     let latestState = null;
     let settingsLoadedOnce = false;
     let pendingDialogAction = null;
+    let pendingDialogRequiresInput = false;
+    let busySignJob = false;
 
     function selectTab(name) {{
       document.querySelectorAll('.tab-btn').forEach(btn => {{
@@ -573,20 +591,37 @@ def _build_html():
       el.textContent = msg || '';
     }}
 
-    function openDialog(title, body, onConfirm) {{
+    function openDialog(title, body, onConfirm, opts = {{}}) {{
       document.getElementById('dlg-title').textContent = title;
       document.getElementById('dlg-body').textContent = body;
+      const inputWrap = document.getElementById('dlg-input-wrap');
+      const inputEl = document.getElementById('dlg-confirm-input');
+      const linkWrap = document.getElementById('dlg-link-wrap');
+      const errEl = document.getElementById('dlg-error');
+      const confirmBtn = document.getElementById('dlg-confirm-btn');
+
+      pendingDialogRequiresInput = Boolean(opts.requireText);
+      inputWrap.style.display = pendingDialogRequiresInput ? 'block' : 'none';
+      inputEl.value = '';
+      linkWrap.style.display = opts.showPhantomLink ? 'block' : 'none';
+      errEl.style.display = 'none';
+      errEl.textContent = '';
+      confirmBtn.textContent = opts.confirmLabel || 'Confirm';
       pendingDialogAction = onConfirm;
       document.getElementById('confirm-dialog').showModal();
+      if (pendingDialogRequiresInput) setTimeout(() => inputEl.focus(), 50);
     }}
     function closeDialog() {{
       pendingDialogAction = null;
+      pendingDialogRequiresInput = false;
       document.getElementById('confirm-dialog').close();
     }}
-    document.getElementById('dlg-confirm-btn').addEventListener('click', () => {{
+    document.getElementById('dlg-confirm-btn').addEventListener('click', async () => {{
       const fn = pendingDialogAction;
-      closeDialog();
-      if (fn) fn();
+      if (!fn) {{ closeDialog(); return; }}
+      const typed = document.getElementById('dlg-confirm-input').value;
+      const keepOpen = await fn(typed);
+      if (keepOpen !== false) closeDialog();
     }});
 
     async function postAction(url, body = {{}}) {{
@@ -602,8 +637,192 @@ def _build_html():
         return data;
       }} catch (e) {{
         showToast('Request failed: ' + e.message, true);
-        return {{ ok: false }};
+        return {{ ok: false, message: e.message }};
       }}
+    }}
+
+    function getPhantomProvider() {{
+      const p = (window.phantom && window.phantom.solana) || window.solana;
+      return (p && p.isPhantom) ? p : null;
+    }}
+
+    function bindPhantomListeners() {{
+      const p = getPhantomProvider();
+      if (!p || !p.on || p.__sniperBound) return;
+      p.__sniperBound = true;
+      try {{
+        p.on('connect', async (pk) => {{
+          const addr = pk && pk.toString ? pk.toString() : (p.publicKey && p.publicKey.toString());
+          if (addr) await syncPhantomToBackend(addr, true, false);
+        }});
+        p.on('disconnect', async () => {{
+          await postAction('/api/wallets/disconnect', {{ chain: 'solana' }});
+        }});
+        p.on('accountChanged', async (pk) => {{
+          if (pk && pk.toString) await syncPhantomToBackend(pk.toString(), true, false);
+          else await postAction('/api/wallets/disconnect', {{ chain: 'solana' }});
+        }});
+      }} catch {{}}
+    }}
+
+    async function syncPhantomToBackend(address, signingAvailable = true, isReadOnly = false) {{
+      const data = await postAction('/api/wallets/connect', {{
+        chain: 'solana',
+        wallet_id: 'phantom',
+        name: 'Phantom Wallet',
+        type: 'solana',
+        address,
+        signing_available: signingAvailable,
+        is_read_only: isReadOnly,
+        network: 'Solana Mainnet-Beta'
+      }});
+      await refreshWalletBalance();
+      return data;
+    }}
+
+    async function refreshWalletBalance() {{
+      try {{
+        const res = await fetch('/api/wallets/balance');
+        if (res.ok) {{
+          const data = await res.json();
+          if (data.ok) {{
+            showToast(`SOL Balance: ${{Number(data.sol_balance || 0).toFixed(4)}} SOL ($${{Number(data.balance_usd || 0).toFixed(2)}})`);
+            await refreshState();
+          }}
+        }}
+      }} catch {{}}
+    }}
+
+    async function attemptPhantomAutoReconnect() {{
+      const p = getPhantomProvider();
+      if (!p) return false;
+      bindPhantomListeners();
+      try {{
+        if (p.isConnected && p.publicKey) {{
+          await syncPhantomToBackend(p.publicKey.toString(), true, false);
+          return true;
+        }}
+        const resp = await p.connect({{ onlyIfTrusted: true }});
+        const addr = (resp && resp.publicKey && resp.publicKey.toString()) || (p.publicKey && p.publicKey.toString());
+        if (addr) {{
+          await syncPhantomToBackend(addr, true, false);
+          return true;
+        }}
+      }} catch {{}}
+      return false;
+    }}
+
+    async function connectPhantomBrowser() {{
+      const hint = (document.getElementById('ph-wallet-hint') && document.getElementById('ph-wallet-hint').value || '').trim();
+      if (hint && hint.length >= 32) {{
+        await syncPhantomToBackend(hint, false, true);
+        return;
+      }}
+      const p = getPhantomProvider();
+      if (!p) {{
+        openDialog(
+          'Phantom Extension Not Detected',
+          'Phantom browser extension (window.phantom.solana) was not found in this browser tab. Install Phantom from phantom.app, or use "Open Chrome Relay" if your unlocked Phantom lives in a desktop Chrome profile.',
+          () => connectPhantomOnce(),
+          {{ showPhantomLink: true, confirmLabel: 'Open Chrome Relay Instead' }}
+        );
+        return;
+      }}
+      bindPhantomListeners();
+      try {{
+        const resp = await p.connect();
+        const addr = (resp && resp.publicKey && resp.publicKey.toString()) || (p.publicKey && p.publicKey.toString());
+        if (addr) {{
+          await syncPhantomToBackend(addr, true, false);
+        }}
+      }} catch (err) {{
+        const msg = (err && err.code === 4001)
+          ? 'Phantom connection was cancelled by user (code 4001).'
+          : ('Phantom connect error: ' + ((err && err.message) || err));
+        showToast(msg, true);
+      }}
+    }}
+
+    async function disconnectPhantomBrowser() {{
+      const p = getPhantomProvider();
+      try {{ if (p && p.disconnect) await p.disconnect(); }} catch {{}}
+      await postAction('/api/wallets/disconnect', {{ chain: 'solana' }});
+    }}
+
+    function b64ToBytes(b64) {{
+      const bin = atob(b64);
+      const out = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+      return out;
+    }}
+
+    async function sendRawViaRpc(rawBytes) {{
+      let b64 = '';
+      for (let i = 0; i < rawBytes.length; i++) b64 += String.fromCharCode(rawBytes[i]);
+      const encoded = btoa(b64);
+      for (const rpc of FALLBACK_RPCS) {{
+        try {{
+          const r = await fetch(rpc, {{
+            method: 'POST',
+            headers: {{ 'Content-Type': 'application/json' }},
+            body: JSON.stringify({{
+              jsonrpc: '2.0', id: 1, method: 'sendTransaction',
+              params: [encoded, {{ encoding: 'base64', skipPreflight: false, preflightCommitment: 'confirmed', maxRetries: 3 }}]
+            }})
+          }});
+          const j = await r.json();
+          if (j && j.result) return j.result;
+        }} catch {{}}
+      }}
+      throw new Error('Failed to broadcast signed transaction across Solana RPCs');
+    }}
+
+    async function pollPhantomSignJobs() {{
+      const p = getPhantomProvider();
+      if (p && p.isConnected && !busySignJob) {{
+        try {{
+          const res = await fetch('/api/relay/next');
+          if (res.ok) {{
+            const job = await res.json();
+            if (job && job.id && job.tx_b64) {{
+              busySignJob = true;
+              try {{
+                const bytes = b64ToBytes(job.tx_b64);
+                const txObj = (window.solanaWeb3 && window.solanaWeb3.VersionedTransaction)
+                  ? window.solanaWeb3.VersionedTransaction.deserialize(bytes)
+                  : {{ serialize: () => bytes }};
+                showToast(`Approve ${{job.side || 'SWAP'}} transaction in Phantom popup...`);
+                let sig;
+                if (typeof p.signAndSendTransaction === 'function') {{
+                  const sres = await p.signAndSendTransaction(txObj, {{ skipPreflight: false, maxRetries: 3 }});
+                  sig = sres.signature || String(sres);
+                }} else {{
+                  const signedTx = await p.signTransaction(txObj);
+                  sig = await sendRawViaRpc(signedTx.serialize());
+                }}
+                await fetch('/api/relay/result', {{
+                  method: 'POST',
+                  headers: {{ 'Content-Type': 'application/json' }},
+                  body: JSON.stringify({{ id: job.id, ok: true, signature: sig }})
+                }});
+                showToast(`Transaction approved in Phantom: ${{sig.slice(0, 14)}}...`);
+              }} catch (err) {{
+                const isReject = (err && err.code === 4001) || String((err && err.message) || err).toLowerCase().includes('reject');
+                const msg = isReject ? 'User declined transaction in Phantom (code 4001).' : String((err && err.message) || err);
+                await fetch('/api/relay/result', {{
+                  method: 'POST',
+                  headers: {{ 'Content-Type': 'application/json' }},
+                  body: JSON.stringify({{ id: job.id, ok: false, rejected: isReject, error: msg }})
+                }});
+                showToast(msg, true);
+              }} finally {{
+                busySignJob = false;
+              }}
+            }}
+          }}
+        }} catch {{}}
+      }}
+      setTimeout(pollPhantomSignJobs, 400);
     }}
 
     function toggleBot() {{
@@ -614,10 +833,32 @@ def _build_html():
     function requestModeToggle() {{
       const nextMode = (latestState && latestState.mode === 'live') ? 'paper' : 'live';
       if (nextMode === 'live') {{
+        const cfg = (latestState && latestState.config) || {{}};
+        const tradeSol = Number(cfg.live_trade_size_sol || 0.05);
+        const gasSol = Number(cfg.gas_reserved_sol || 0.02);
         openDialog(
-          'Switch to LIVE MODE?',
-          'Live Mode executes swaps through your Phantom Browser-Once session. Ensure your trade size (SOL) and live dry-run settings are configured properly.',
-          () => postAction('/api/mode', {{ mode: 'live' }})
+          'Unlock LIVE MODE (Real SOL Will Be Spent)',
+          `Switching to LIVE MODE stops any running bot and executes real Solana mainnet swaps via Phantom popup approval. Each trade uses ${{tradeSol}} SOL plus ${{gasSol}} SOL reserved for network gas fees.`,
+          async (typed) => {{
+            const errEl = document.getElementById('dlg-error');
+            const res = await fetch('/api/live/confirm', {{
+              method: 'POST',
+              headers: {{ 'Content-Type': 'application/json' }},
+              body: JSON.stringify({{ confirmation: typed }}),
+            }});
+            const data = await res.json();
+            if (!data.ok) {{
+              errEl.textContent = data.message || 'Live Mode confirmation failed.';
+              errEl.style.display = 'block';
+              showToast(errEl.textContent, true);
+              await refreshState();
+              return false;
+            }}
+            showToast(data.message || 'LIVE MODE unlocked!');
+            await refreshState();
+            return true;
+          }},
+          {{ requireText: true, confirmLabel: 'Unlock Live Mode' }}
         );
       }} else {{
         postAction('/api/mode', {{ mode: 'paper' }});
@@ -630,7 +871,7 @@ def _build_html():
       const profEl = document.getElementById('ph-chrome-profile');
       const connection_mode = modeEl ? modeEl.value : 'existing_chrome';
       const chrome_profile = profEl ? profEl.value : 'Default';
-      showToast(`Opening Phantom bridge in Chrome (${{chrome_profile}})...`);
+      showToast(`Opening Phantom bridge tab in Chrome (${{chrome_profile}})...`);
       postAction('/api/phantom/connect', {{ wallet_hint: hint, connection_mode, chrome_profile }});
     }}
 
@@ -745,7 +986,9 @@ def _build_html():
       document.getElementById('phantom-top-addr').textContent = ph.wallet_address
         ? `${{ph.wallet_address.slice(0, 6)}}...${{ph.wallet_address.slice(-4)}}`
         : 'not connected';
-      document.getElementById('phantom-top-sol').textContent = `${{Number(ph.sol_balance || 0).toFixed(4)}} SOL`;
+      document.getElementById('phantom-top-sol').textContent = `${{Number(ph.sol_balance || 0).toFixed(4)}} SOL ($${{Number(ph.balance_usd || 0).toFixed(2)}})`;
+      const discBtn = document.getElementById('btn-phantom-disc');
+      if (discBtn) discBtn.style.display = ph.connected_once ? 'inline-block' : 'none';
 
       // Cards
       const stats = s.stats || {{}};
@@ -811,19 +1054,25 @@ def _build_html():
       if (modeSelect && ph.connection_mode && document.activeElement !== modeSelect) {{
         modeSelect.value = ph.connection_mode;
       }}
-      document.getElementById('phantom-kv').innerHTML = [
-        ['Status', ph.status],
-        ['Connected Once', String(ph.connected_once)],
-        ['Wallet Address', ph.wallet_address || '(none)'],
-        ['SOL Balance', `${{Number(ph.sol_balance || 0).toFixed(6)}} SOL`],
-        ['Connection Mode', `${{ph.connection_mode}} (profile=${{ph.chrome_profile}})`],
-        ['Driver', `${{ph.driver}} (relay_alive=${{ph.relay_tab_alive}}, active=${{ph.browser_active}})`],
-        ['Relay URL', ph.relay_url || '(starts on connect)'],
-        ['Extension Found', `${{ph.extension_detected}} (${{ph.extension_path || 'auto'}})`],
-        ['Chromium Found', `${{ph.chromium_detected}} (${{ph.chromium_path || 'not found'}})`],
-        ['Last Tx Sig', ph.last_tx_sig || '-'],
-        ['Last Message', ph.last_error || 'OK'],
-      ].map(([k, v]) => `<div class="k">${{esc(k)}}</div><div class="v">${{esc(v)}}</div>`).join('');
+      const lastSigHtml = (ph.last_tx_sig && !String(ph.last_tx_sig).startsWith('DRYRUN_'))
+        ? `<a href="https://solscan.io/tx/${{esc(ph.last_tx_sig)}}" target="_blank" rel="noopener noreferrer" style="color:var(--blue);">${{esc(ph.last_tx_sig)}}</a>`
+        : esc(ph.last_tx_sig || '-');
+      const kvRows = [
+        ['Status', `${{ph.status}} (live_armed=${{Boolean(s.live_mode_confirmed)}})`, false],
+        ['Wallet Address', ph.wallet_address || '(none)', false],
+        ['SOL Balance', `${{Number(ph.sol_balance || 0).toFixed(6)}} SOL ($${{Number(ph.balance_usd || 0).toFixed(2)}} USD)`, false],
+        ['Gas Reserve', `${{Number(ph.gas_reserved_sol ?? 0.02).toFixed(4)}} SOL kept for network fees`, false],
+        ['Signing Capable', `${{Boolean(ph.signing_available)}} (read_only=${{Boolean(ph.is_read_only)}})`, false],
+        ['Solana RPC', ph.rpc_endpoint || FALLBACK_RPCS[0], false],
+        ['Connection Mode', `${{ph.connection_mode}} (profile=${{ph.chrome_profile}})`, false],
+        ['Driver', `${{ph.driver}} (relay_alive=${{ph.relay_tab_alive}}, active=${{ph.browser_active}})`, false],
+        ['Relay URL', ph.relay_url || '(active on desktop connect)', false],
+        ['Last Tx Sig', lastSigHtml, true],
+        ['Last Message', ph.last_error || 'OK', false],
+      ];
+      document.getElementById('phantom-kv').innerHTML = kvRows.map(
+        ([k, v, isHtml]) => `<div class="k">${{esc(k)}}</div><div class="v">${{isHtml ? v : esc(v)}}</div>`
+      ).join('');
 
       // History
       const trades = s.trades || [];
@@ -857,6 +1106,12 @@ def _build_html():
     }}
 
     refreshState();
+    window.addEventListener('load', () => {{
+      setTimeout(() => {{
+        attemptPhantomAutoReconnect();
+        pollPhantomSignJobs();
+      }}, 300);
+    }});
     const evtSource = new EventSource('/api/events');
     evtSource.onmessage = (e) => {{
       try {{ renderState(JSON.parse(e.data)); }} catch {{}}
@@ -909,6 +1164,29 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._send_json(eng.snapshot())
             return
 
+        if path == "/api/wallets/balance":
+            sol_usd = eng.stream_mgr.sol_price_usd if eng.stream_mgr.sol_price_usd > 1.0 else 180.0
+            bal = eng.bridge.refresh_sol_balance(sol_price_usd=sol_usd)
+            eng.live_acct.sync_wallet_cash()
+            ph = eng.bridge.get_status()
+            self._send_json({
+                "ok": True,
+                "address": ph["wallet_address"],
+                "sol_balance": bal,
+                "balance_usd": ph["balance_usd"],
+                "sol_price_usd": sol_usd,
+                "rpc_endpoint": ph["rpc_endpoint"],
+                "gas_reserved_sol": ph["gas_reserved_sol"],
+                "signing_available": ph["signing_available"],
+                "is_read_only": ph["is_read_only"],
+            })
+            return
+
+        if path == "/api/relay/next":
+            job = eng.bridge.pop_pending_sign_job()
+            self._send_json(job or {})
+            return
+
         if path == "/api/events":
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -947,9 +1225,54 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._send_json({"ok": True, "message": f"Probe complete: {res.get('candidates', 0)} candidates", "probe": res})
             return
 
+        if path == "/api/live/confirm":
+            ok, msg = eng.confirm_enable_live_mode(body.get("confirmation", ""))
+            self._send_json(
+                {"ok": ok, "message": msg, "mode": eng.mode, "live_mode_confirmed": eng.live_mode_confirmed},
+                status=200 if ok else 400,
+            )
+            return
+
         if path == "/api/mode":
-            ok, msg = eng.set_mode(body.get("mode", "paper"))
+            target_mode = str(body.get("mode", "paper")).lower().strip()
+            if target_mode == "live":
+                ok, msg = eng.confirm_enable_live_mode(body.get("confirmation", ""))
+            else:
+                ok, msg = eng.set_mode("paper")
             self._send_json({"ok": ok, "message": msg}, status=200 if ok else 400)
+            return
+
+        if path == "/api/wallets/connect":
+            addr = str(body.get("address") or body.get("publicKey") or "").strip()
+            if len(addr) < 32:
+                self._send_json({"ok": False, "message": "Invalid Solana wallet address"}, status=400)
+                return
+            sol_usd = eng.stream_mgr.sol_price_usd if eng.stream_mgr.sol_price_usd > 1.0 else 180.0
+            eng.bridge.set_connected_wallet(
+                address=addr,
+                signing_available=bool(body.get("signing_available", True)),
+                is_read_only=bool(body.get("is_read_only", False)),
+                driver="phantom_browser_extension" if body.get("signing_available", True) else "read_only_address",
+                sol_price_usd=sol_usd,
+            )
+            eng.live_acct.sync_wallet_cash()
+            ph = eng.bridge.get_status()
+            self._send_json({
+                "ok": True,
+                "message": f"Phantom connected: {addr[:6]}...{addr[-4:]} ({ph['sol_balance']:.4f} SOL)",
+                "phantom": ph,
+            })
+            return
+
+        if path == "/api/wallets/disconnect":
+            ok, msg = eng.disconnect_phantom()
+            self._send_json({"ok": ok, "message": msg, "phantom": eng.bridge.get_status()})
+            return
+
+        if path == "/api/relay/result":
+            jid = str(body.get("id") or "")
+            eng.bridge.submit_sign_result(jid, body)
+            self._send_json({"ok": True})
             return
 
         if path == "/api/phantom/connect":
@@ -961,7 +1284,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/phantom/refresh":
-            bal = eng.bridge.refresh_sol_balance()
+            sol_usd = eng.stream_mgr.sol_price_usd if eng.stream_mgr.sol_price_usd > 1.0 else 180.0
+            bal = eng.bridge.refresh_sol_balance(sol_price_usd=sol_usd)
             eng.live_acct.sync_wallet_cash()
             self._send_json({"ok": True, "message": f"Balance: {bal:.4f} SOL", "phantom": eng.bridge.get_status()})
             return
@@ -1001,9 +1325,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._send_json({"ok": False, "errors": errors, "message": errors[0]}, status=400)
                 return
             bot.CONFIG.update(parsed)
+            eng.bridge.gas_reserved_sol = float(bot.CONFIG.get("gas_reserved_sol", 0.02))
+            if parsed.get("trading_mode") == "paper" and eng.mode != "paper" and not eng.running:
+                eng.set_mode("paper")
+            elif parsed.get("trading_mode") == "live" and eng.mode != "live":
+                # Do not silently bypass ENABLE LIVE safety gate via settings
+                bot.CONFIG["trading_mode"] = eng.mode
             save_settings()
-            if parsed.get("trading_mode") != eng.mode and not eng.running:
-                eng.set_mode(parsed["trading_mode"])
             self._send_json({"ok": True, "message": "Settings applied and saved."})
             return
 

@@ -1,0 +1,676 @@
+/**
+ * phantomLiveWallet.ts
+ * All-in-one Phantom Live Wallet Connection, Browser Popup Confirmation,
+ * Live Mode Safety Gate, On-Chain Balance Query, and Jupiter Live Trade Execution.
+ *
+ * Dependencies: npm install @solana/web3.js bs58
+ */
+
+import { Connection, Keypair, PublicKey, VersionedTransaction } from '@solana/web3.js';
+import bs58 from 'bs58';
+
+// ============================================================================
+// 1. TYPES & GLOBAL BROWSER PROVIDER DECLARATIONS
+// ============================================================================
+
+export type ExecutionMode = 'paper' | 'testnet' | 'live';
+
+export interface PhantomWalletState {
+  id: 'phantom';
+  name: string;
+  installed: boolean;
+  connected: boolean;
+  address: string | null;
+  nativeBalanceSol: number;
+  balanceUsd: number;
+  gasReservedSol: number;
+  status: 'DISCONNECTED' | 'CONNECTING' | 'CONNECTED' | 'ERROR';
+  signingAvailable: boolean;
+  isReadOnly: boolean;
+  rpcEndpoint: string;
+  lastUpdated: number | null;
+  errorReason?: string;
+}
+
+export interface LiveTradeResult {
+  success: boolean;
+  signature?: string;
+  explorerUrl?: string;
+  actualTokensOut?: number;
+  actualSolDelta?: number;
+  feeLamports?: number;
+  error?: string;
+}
+
+declare global {
+  interface Window {
+    phantom?: { solana?: any; ethereum?: any };
+    solana?: any;
+  }
+}
+
+const WSOL_MINT = 'So11111111111111111111111111111111111111112';
+
+export const SOLANA_RPC_ENDPOINTS = [
+  'https://api.mainnet-beta.solana.com',
+  'https://rpc.ankr.com/solana',
+  'https://solana-rpc.publicnode.com',
+];
+
+// ============================================================================
+// 2. PHANTOM BROWSER EXTENSION DETECTION, POPUP CONNECTION & LISTENERS
+// ============================================================================
+
+export class PhantomLiveConnector {
+  private state: PhantomWalletState = {
+    id: 'phantom',
+    name: 'Phantom Wallet',
+    installed: false,
+    connected: false,
+    address: null,
+    nativeBalanceSol: 0,
+    balanceUsd: 0,
+    gasReservedSol: 0.02,
+    status: 'DISCONNECTED',
+    signingAvailable: false,
+    isReadOnly: false,
+    rpcEndpoint: SOLANA_RPC_ENDPOINTS[0],
+    lastUpdated: null,
+  };
+
+  private currentMode: ExecutionMode = 'paper';
+  private liveModeConfirmed = false;
+  private listeners: Array<(state: PhantomWalletState) => void> = [];
+
+  constructor() {
+    this.state.installed = Boolean(this.getProvider());
+    this.initProviderListeners();
+    this.attemptAutoReconnect();
+  }
+
+  /** Detect injected Phantom Solana browser extension */
+  public getProvider(): any | null {
+    if (typeof window === 'undefined') return null;
+    const provider = window.phantom?.solana || window.solana;
+    return provider && provider.isPhantom ? provider : null;
+  }
+
+  public getState(): PhantomWalletState {
+    return { ...this.state };
+  }
+
+  public subscribe(listener: (state: PhantomWalletState) => void): () => void {
+    this.listeners.push(listener);
+    return () => {
+      this.listeners = this.listeners.filter((l) => l !== listener);
+    };
+  }
+
+  private notify() {
+    const snapshot = this.getState();
+    this.listeners.forEach((cb) => cb(snapshot));
+  }
+
+  /** Bind browser extension events (connect, disconnect, account switch) */
+  private initProviderListeners() {
+    const provider = this.getProvider();
+    if (!provider || !provider.on) return;
+
+    try {
+      provider.on('connect', async (publicKey: any) => {
+        const addr = publicKey?.toString();
+        if (addr) await this.onConnected(addr);
+      });
+
+      provider.on('disconnect', () => {
+        this.onDisconnected();
+      });
+
+      provider.on('accountChanged', async (publicKey: any) => {
+        if (publicKey) {
+          await this.onConnected(publicKey.toString());
+        } else {
+          this.onDisconnected();
+        }
+      });
+    } catch {}
+  }
+
+  /** Silent auto-reconnect if user previously approved this site in Phantom */
+  public async attemptAutoReconnect(): Promise<boolean> {
+    const provider = this.getProvider();
+    if (!provider) return false;
+
+    try {
+      if (provider.isConnected && provider.publicKey) {
+        await this.onConnected(provider.publicKey.toString());
+        return true;
+      }
+      if (provider.connect) {
+        const resp = await provider.connect({ onlyIfTrusted: true });
+        if (resp?.publicKey) {
+          await this.onConnected(resp.publicKey.toString());
+          return true;
+        }
+      }
+    } catch {
+      // Not previously trusted; wait for manual connect click
+    }
+    return false;
+  }
+
+  /**
+   * OPENS PHANTOM BROWSER EXTENSION POPUP & ASKS USER TO APPROVE CONNECTION.
+   * Note: Must be triggered from a user interaction or unlocked browser session.
+   */
+  public async connectPhantomBrowser(): Promise<boolean> {
+    this.state.status = 'CONNECTING';
+    this.state.errorReason = undefined;
+    this.notify();
+
+    const provider = this.getProvider();
+    if (!provider) {
+      this.state.status = 'ERROR';
+      this.state.installed = false;
+      this.state.errorReason = 'Phantom extension not found. Opening phantom.app download page.';
+      this.notify();
+      if (typeof window !== 'undefined') {
+        window.open('https://phantom.app/', '_blank', 'noopener,noreferrer');
+      }
+      return false;
+    }
+
+    try {
+      // Triggers the Phantom extension popup window asking user for Connect confirmation
+      const resp = await provider.connect();
+      const address = resp?.publicKey?.toString() || provider.publicKey?.toString();
+
+      if (!address) {
+        this.state.status = 'ERROR';
+        this.state.errorReason = 'Failed to retrieve public key from Phantom.';
+        this.notify();
+        return false;
+      }
+
+      await this.onConnected(address);
+      return true;
+    } catch (err: any) {
+      // User clicked Cancel / Reject in Phantom popup (code 4001)
+      this.state.status = 'ERROR';
+      this.state.connected = false;
+      this.state.errorReason = err?.message || 'User rejected Phantom wallet connection.';
+      this.notify();
+      return false;
+    }
+  }
+
+  public async disconnectPhantom(): Promise<void> {
+    const provider = this.getProvider();
+    try {
+      if (provider?.disconnect) await provider.disconnect();
+    } catch {}
+    this.onDisconnected();
+  }
+
+  private async onConnected(address: string) {
+    this.state.address = address;
+    this.state.connected = true;
+    this.state.installed = true;
+    this.state.status = 'CONNECTED';
+    this.state.signingAvailable = true;
+    this.state.isReadOnly = false;
+    this.state.errorReason = undefined;
+
+    await this.refreshOnChainBalance();
+    await this.syncWalletToBackend();
+    this.notify();
+  }
+
+  private onDisconnected() {
+    this.state.connected = false;
+    this.state.status = 'DISCONNECTED';
+    this.state.address = null;
+    this.state.nativeBalanceSol = 0;
+    this.state.balanceUsd = 0;
+    this.state.signingAvailable = false;
+    this.state.lastUpdated = null;
+    this.liveModeConfirmed = false;
+    this.notify();
+
+    fetch('/api/wallets/disconnect', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chain: 'solana' }),
+    }).catch(() => {});
+  }
+
+  // ============================================================================
+  // 3. LIVE MODE CONFIRMATION SAFETY GATE (e.g. Typing "ENABLE LIVE")
+  // ============================================================================
+
+  /**
+   * Validates explicit user confirmation before allowing live mainnet trades.
+   * Mirrors LiveConfirmModal.tsx validation.
+   */
+  public confirmEnableLiveMode(confirmationInput: string, minTradeSol = 0.02): {
+    allowed: boolean;
+    reason: string;
+  } {
+    const normalized = confirmationInput.trim().toUpperCase().replace(/\s+/g, ' ');
+    const isMatch = normalized === 'ENABLE LIVE' || normalized === 'LIVE' || normalized === 'ENABLE';
+
+    if (!isMatch) {
+      return { allowed: false, reason: 'Type "ENABLE LIVE" to confirm live mainnet execution.' };
+    }
+    if (!this.state.connected || !this.state.address) {
+      return { allowed: false, reason: 'Connect your Phantom wallet first before enabling Live Mode.' };
+    }
+    const minRequired = minTradeSol + this.state.gasReservedSol;
+    if (this.state.nativeBalanceSol < minRequired) {
+      return {
+        allowed: false,
+        reason: `Insufficient SOL (${this.state.nativeBalanceSol.toFixed(5)} SOL). Need at least ${minRequired.toFixed(5)} SOL (trade + gas reserve).`,
+      };
+    }
+
+    this.currentMode = 'live';
+    this.liveModeConfirmed = true;
+    return { allowed: true, reason: 'Live Mode confirmed and armed with Phantom wallet.' };
+  }
+
+  public isLiveReady(tradeAmountSol: number): { ready: boolean; reason: string } {
+    if (this.currentMode !== 'live' || !this.liveModeConfirmed) {
+      return { ready: false, reason: 'Live mode is not confirmed.' };
+    }
+    if (!this.state.connected || !this.state.address) {
+      return { ready: false, reason: 'Phantom wallet disconnected.' };
+    }
+    if (!this.state.signingAvailable || this.state.isReadOnly) {
+      return { ready: false, reason: 'Wallet is read-only; browser signing unavailable.' };
+    }
+    if (this.state.nativeBalanceSol < tradeAmountSol + this.state.gasReservedSol) {
+      return { ready: false, reason: 'Insufficient SOL for trade + gas reserve.' };
+    }
+    return { ready: true, reason: 'READY' };
+  }
+
+  // ============================================================================
+  // 4. REAL ON-CHAIN BALANCE QUERY & BACKEND SYNC
+  // ============================================================================
+
+  public async refreshOnChainBalance(): Promise<number> {
+    if (!this.state.address) return 0;
+
+    // Try backend proxy first, then direct Solana RPC fallback
+    try {
+      const res = await fetch(
+        `/api/wallets/balance?chain=solana&address=${encodeURIComponent(this.state.address)}`
+      );
+      if (res.ok) {
+        const data = await res.json();
+        if (data.success && typeof data.native_balance === 'number') {
+          this.state.nativeBalanceSol = data.native_balance;
+          this.state.balanceUsd = data.balance_usd || 0;
+          this.state.rpcEndpoint = data.rpc_endpoint || SOLANA_RPC_ENDPOINTS[0];
+          this.state.lastUpdated = Date.now();
+          this.notify();
+          return data.native_balance;
+        }
+      }
+    } catch {}
+
+    // Direct Solana RPC getBalance fallback
+    for (const endpoint of SOLANA_RPC_ENDPOINTS) {
+      try {
+        const rpcResp = await fetch(endpoint, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            jsonrpc: '2.0',
+            id: 1,
+            method: 'getBalance',
+            params: [this.state.address, { commitment: 'confirmed' }],
+          }),
+        });
+        if (rpcResp.ok) {
+          const rpcData = await rpcResp.json();
+          if (rpcData.result?.value !== undefined) {
+            const solBal = rpcData.result.value / 1e9;
+            this.state.nativeBalanceSol = solBal;
+            this.state.balanceUsd = solBal * 145.0;
+            this.state.rpcEndpoint = endpoint;
+            this.state.lastUpdated = Date.now();
+            this.notify();
+            return solBal;
+          }
+        }
+      } catch {}
+    }
+
+    return this.state.nativeBalanceSol;
+  }
+
+  public async syncWalletToBackend(): Promise<boolean> {
+    if (!this.state.address) return false;
+    try {
+      const res = await fetch('/api/wallets/connect', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chain: 'solana',
+          wallet_id: 'phantom',
+          name: 'Phantom Wallet',
+          type: 'solana',
+          address: this.state.address,
+          native_balance: `${this.state.nativeBalanceSol.toFixed(5)} SOL`,
+          balance_usd: `$${this.state.balanceUsd.toFixed(2)}`,
+          signing_available: this.state.signingAvailable && !this.state.isReadOnly,
+          network: 'Solana Mainnet-Beta',
+        }),
+      });
+      return res.ok;
+    } catch {
+      return false;
+    }
+  }
+
+  // ============================================================================
+  // 5. LIVE JUPITER SWAP WITH PHANTOM BROWSER POPUP CONFIRMATION
+  //    (Private key NEVER leaves Phantom extension)
+  // ============================================================================
+
+  public async executeLiveSwapWithPhantomPopup(params: {
+    inputMint: string;         // Use WSOL_MINT for BUY, tokenMint for SELL
+    outputMint: string;        // Use tokenMint for BUY, WSOL_MINT for SELL
+    rawAmount: number;         // Lamports (SOL * 1e9) or base token units (qty * 10^decimals)
+    slippageBps?: number;      // e.g. 150 = 1.5%
+    priorityFeeLevel?: 'standard' | 'high' | 'ultra';
+    onStatus?: (step: string) => void;
+  }): Promise<LiveTradeResult> {
+    const provider = this.getProvider();
+    if (!provider || !this.state.connected || !this.state.address) {
+      return { success: false, error: 'Phantom wallet is not connected in this browser.' };
+    }
+
+    const notify = (msg: string) => params.onStatus?.(msg);
+    const conn = new Connection(this.state.rpcEndpoint || SOLANA_RPC_ENDPOINTS[0], {
+      commitment: 'confirmed',
+      confirmTransactionInitialTimeout: 30000,
+    });
+
+    try {
+      // Step A: Fetch executable route quote from Jupiter v6
+      notify('Fetching Jupiter swap quote...');
+      const quoteUrl =
+        `https://quote-api.jup.ag/v6/quote?inputMint=${params.inputMint}` +
+        `&outputMint=${params.outputMint}&amount=${Math.floor(params.rawAmount)}` +
+        `&slippageBps=${params.slippageBps ?? 150}&swapMode=ExactIn`;
+
+      const quoteRes = await fetch(quoteUrl);
+      if (!quoteRes.ok) throw new Error(`Jupiter Quote failed: ${await quoteRes.text()}`);
+      const quoteResponse = await quoteRes.json();
+      if (!quoteResponse?.outAmount) throw new Error('No executable Jupiter route found.');
+
+      // Step B: Request serialized VersionedTransaction from Jupiter Swap API
+      notify('Building Solana swap transaction...');
+      const feeMap = { standard: 50000, high: 250000, ultra: 1000000 };
+      const swapRes = await fetch('https://quote-api.jup.ag/v6/swap', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          quoteResponse,
+          userPublicKey: this.state.address,
+          wrapAndUnwrapSol: true,
+          dynamicComputeUnitLimit: true,
+          prioritizationFeeLamports: feeMap[params.priorityFeeLevel || 'standard'],
+        }),
+      });
+      if (!swapRes.ok) throw new Error(`Jupiter Swap build failed: ${await swapRes.text()}`);
+      const swapData = await swapRes.json();
+      if (!swapData?.swapTransaction) throw new Error('Invalid transaction returned by Jupiter.');
+
+      // Step C: Deserialize transaction & trigger Phantom Browser Confirmation Popup
+      const txBytes = Uint8Array.from(atob(swapData.swapTransaction), (c) => c.charCodeAt(0));
+      const versionedTx = VersionedTransaction.deserialize(txBytes);
+
+      notify('Waiting for your Approve click in Phantom browser popup...');
+      let signature: string;
+
+      // Phantom shows transaction simulation & asks user to Approve or Cancel
+      if (typeof provider.signAndSendTransaction === 'function') {
+        const res = await provider.signAndSendTransaction(versionedTx, {
+          skipPreflight: false,
+          maxRetries: 3,
+        });
+        signature = res.signature;
+      } else {
+        const signedTx: VersionedTransaction = await provider.signTransaction(versionedTx);
+        signature = await conn.sendRawTransaction(signedTx.serialize(), {
+          skipPreflight: false,
+          maxRetries: 3,
+          preflightCommitment: 'confirmed',
+        });
+      }
+
+      // Step D: Poll Solana RPC until transaction is confirmed on-chain
+      notify(`Confirming transaction ${signature.slice(0, 8)}... on Solana mainnet`);
+      const verified = await confirmAndVerifySolanaTransaction(
+        signature,
+        conn,
+        params.outputMint === WSOL_MINT ? params.inputMint : params.outputMint,
+        this.state.address
+      );
+
+      if (!verified.confirmed) {
+        return {
+          success: false,
+          signature,
+          explorerUrl: `https://solscan.io/tx/${signature}`,
+          error: verified.error || 'Transaction failed or timed out.',
+        };
+      }
+
+      await this.refreshOnChainBalance();
+      notify(`Confirmed! Solscan: https://solscan.io/tx/${signature}`);
+
+      return {
+        success: true,
+        signature,
+        explorerUrl: `https://solscan.io/tx/${signature}`,
+        actualTokensOut: verified.actualTokensReceived,
+        actualSolDelta: verified.actualSolSpent ?? verified.actualSolReceived,
+        feeLamports: verified.feeLamports,
+      };
+    } catch (err: any) {
+      const msg = String(err?.message || err);
+      if (err?.code === 4001 || msg.toLowerCase().includes('reject')) {
+        return { success: false, error: 'You declined the swap confirmation in Phantom.' };
+      }
+      return { success: false, error: `Live swap failed: ${msg}` };
+    }
+  }
+}
+
+// ============================================================================
+// 6. ON-CHAIN TRANSACTION CONFIRMATION & PARSED RECEIPT VERIFIER
+// ============================================================================
+
+export async function confirmAndVerifySolanaTransaction(
+  signature: string,
+  connection: Connection,
+  targetMint?: string,
+  userPubkey?: string
+): Promise<{
+  confirmed: boolean;
+  actualTokensReceived?: number;
+  actualSolSpent?: number;
+  actualSolReceived?: number;
+  feeLamports?: number;
+  error?: string;
+}> {
+  const startTime = Date.now();
+  let confirmed = false;
+
+  while (Date.now() - startTime < 35000) {
+    try {
+      const status = await connection.getSignatureStatus(signature, { searchTransactionHistory: true });
+      if (status?.value) {
+        if (status.value.err) {
+          return { confirmed: false, error: `On-chain error: ${JSON.stringify(status.value.err)}` };
+        }
+        if (
+          status.value.confirmationStatus === 'confirmed' ||
+          status.value.confirmationStatus === 'finalized'
+        ) {
+          confirmed = true;
+          break;
+        }
+      }
+    } catch {}
+    await new Promise((r) => setTimeout(r, 1500));
+  }
+
+  if (!confirmed) {
+    return { confirmed: false, error: 'Transaction confirmation timed out after 35s.' };
+  }
+
+  let actualTokensReceived: number | undefined;
+  let actualSolSpent: number | undefined;
+  let actualSolReceived: number | undefined;
+  let feeLamports: number | undefined;
+
+  try {
+    const parsedTx = await connection.getParsedTransaction(signature, {
+      maxSupportedTransactionVersion: 0,
+      commitment: 'confirmed',
+    });
+
+    if (parsedTx?.meta) {
+      feeLamports = parsedTx.meta.fee;
+      if (userPubkey) {
+        const accountKeys = parsedTx.transaction.message.accountKeys.map((k: any) =>
+          typeof k === 'string' ? k : k.pubkey.toBase58()
+        );
+        const idx = accountKeys.indexOf(userPubkey);
+        if (idx !== -1) {
+          const diff = (parsedTx.meta.preBalances[idx] || 0) - (parsedTx.meta.postBalances[idx] || 0);
+          if (diff > 0) actualSolSpent = (diff - (feeLamports || 0)) / 1e9;
+          else actualSolReceived = Math.abs(diff) / 1e9;
+        }
+        if (targetMint) {
+          const pre = parsedTx.meta.preTokenBalances?.find(
+            (b: any) => b.owner === userPubkey && b.mint === targetMint
+          );
+          const post = parsedTx.meta.postTokenBalances?.find(
+            (b: any) => b.owner === userPubkey && b.mint === targetMint
+          );
+          const delta = (post?.uiTokenAmount?.uiAmount || 0) - (pre?.uiTokenAmount?.uiAmount || 0);
+          if (delta > 0) actualTokensReceived = delta;
+        }
+      }
+    }
+  } catch {}
+
+  return { confirmed: true, actualTokensReceived, actualSolSpent, actualSolReceived, feeLamports };
+}
+
+// ============================================================================
+// 7. OPTIONAL: SERVER-SIDE AUTONOMOUS SIGNER (UNATTENDED LIVE BOT MODE)
+//    Used only when running auto-buy/auto-sell without browser popups.
+// ============================================================================
+
+let serverTradingKeypair: Keypair | null = null;
+
+export function setServerTradingKeypair(secretKeyInput: string): { success: boolean; address?: string; error?: string } {
+  try {
+    const trimmed = secretKeyInput.trim();
+    const keyBytes =
+      trimmed.startsWith('[') && trimmed.endsWith(']')
+        ? Uint8Array.from(JSON.parse(trimmed))
+        : bs58.decode(trimmed);
+
+    serverTradingKeypair =
+      keyBytes.length === 64 ? Keypair.fromSecretKey(keyBytes) : Keypair.fromSeed(keyBytes);
+
+    return { success: true, address: serverTradingKeypair.publicKey.toBase58() };
+  } catch (err: any) {
+    return { success: false, error: err.message };
+  }
+}
+
+export async function executeServerSideLiveBuy(
+  tokenMint: string,
+  tradeAmountSol: number,
+  slippageBps = 150
+): Promise<LiveTradeResult> {
+  if (!serverTradingKeypair) {
+    return { success: false, error: 'No server trading keypair configured.' };
+  }
+
+  const conn = new Connection(SOLANA_RPC_ENDPOINTS[0], 'confirmed');
+  const userPubkey = serverTradingKeypair.publicKey.toBase58();
+  const lamportsIn = Math.floor(tradeAmountSol * 1e9);
+
+  const quoteRes = await fetch(
+    `https://quote-api.jup.ag/v6/quote?inputMint=${WSOL_MINT}&outputMint=${tokenMint}&amount=${lamportsIn}&slippageBps=${slippageBps}`
+  );
+  const quoteResponse = await quoteRes.json();
+
+  const swapRes = await fetch('https://quote-api.jup.ag/v6/swap', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      quoteResponse,
+      userPublicKey: userPubkey,
+      wrapAndUnwrapSol: true,
+      dynamicComputeUnitLimit: true,
+      prioritizationFeeLamports: 50000,
+    }),
+  });
+  const { swapTransaction } = await swapRes.json();
+
+  const versionedTx = VersionedTransaction.deserialize(Buffer.from(swapTransaction, 'base64'));
+  versionedTx.sign([serverTradingKeypair]);
+
+  const signature = await conn.sendRawTransaction(versionedTx.serialize(), {
+    skipPreflight: false,
+    maxRetries: 3,
+    preflightCommitment: 'confirmed',
+  });
+
+  const verified = await confirmAndVerifySolanaTransaction(signature, conn, tokenMint, userPubkey);
+  return {
+    success: verified.confirmed,
+    signature,
+    explorerUrl: `https://solscan.io/tx/${signature}`,
+    actualTokensOut: verified.actualTokensReceived,
+    actualSolDelta: verified.actualSolSpent,
+    feeLamports: verified.feeLamports,
+    error: verified.error,
+  };
+}
+
+// ============================================================================
+// 8. QUICK USAGE EXAMPLE
+// ============================================================================
+/*
+const phantom = new PhantomLiveConnector();
+
+// 1) User clicks "Connect Phantom" -> opens Phantom browser extension popup
+const connected = await phantom.connectPhantomBrowser();
+
+// 2) User types "ENABLE LIVE" in confirmation modal
+const gate = phantom.confirmEnableLiveMode('ENABLE LIVE', 0.02);
+
+// 3) User executes live BUY -> opens Phantom popup to Approve/Sign the Jupiter swap
+if (connected && gate.allowed) {
+  const result = await phantom.executeLiveSwapWithPhantomPopup({
+    inputMint: WSOL_MINT,
+    outputMint: 'TARGET_TOKEN_MINT_ADDRESS',
+    rawAmount: 0.02 * 1e9, // 0.02 SOL
+    slippageBps: 150,
+    onStatus: (msg) => console.log('[PHANTOM LIVE]', msg),
+  });
+  console.log(result);
+}
+*/

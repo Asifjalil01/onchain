@@ -236,6 +236,70 @@ class TestSettingsAndWebDashboard(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue(json.loads(resp_raw)["ok"])
 
+    def test_wallet_connect_balance_live_confirm_gate_and_disconnect(self):
+        eng = web_dashboard.get_engine()
+        orig_refresh = eng.bridge.refresh_sol_balance
+        eng.bridge.refresh_sol_balance = lambda *a, **kw: eng.bridge.sol_balance
+        try:
+            eng.disconnect_phantom()
+
+            # 1) Wrong confirmation text rejected
+            status, raw = self._req("/api/live/confirm", method="POST", body={"confirmation": "YES"})
+            self.assertEqual(status, 400)
+            self.assertFalse(json.loads(raw)["ok"])
+
+            # 2) Valid text but no wallet connected -> blocked
+            status, raw = self._req("/api/live/confirm", method="POST", body={"confirmation": "ENABLE LIVE"})
+            self.assertEqual(status, 400)
+            self.assertIn("No Phantom wallet", json.loads(raw)["message"])
+
+            # 3) Read-only wallet -> blocked
+            status, _ = self._req("/api/wallets/connect", method="POST", body={
+                "address": "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d",
+                "signing_available": False,
+                "is_read_only": True,
+            })
+            self.assertEqual(status, 200)
+            status, raw = self._req("/api/live/confirm", method="POST", body={"confirmation": "ENABLE LIVE"})
+            self.assertEqual(status, 400)
+            self.assertIn("read-only", json.loads(raw)["message"])
+
+            # 4) Signing wallet connected but balance below trade (0.05) + gas reserve (0.02) -> blocked
+            eng.bridge.sol_balance = 0.06
+            status, _ = self._req("/api/wallets/connect", method="POST", body={
+                "address": "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d",
+                "signing_available": True,
+                "is_read_only": False,
+            })
+            self.assertEqual(status, 200)
+            status, raw = self._req("/api/live/confirm", method="POST", body={"confirmation": "ENABLE LIVE"})
+            self.assertEqual(status, 400)
+            self.assertIn("Insufficient SOL", json.loads(raw)["message"])
+
+            # 5) Sufficient balance + ENABLE LIVE -> unlocks Live Mode
+            eng.bridge.sol_balance = 0.5
+            status, raw = self._req("/api/live/confirm", method="POST", body={"confirmation": "enable live"})
+            self.assertEqual(status, 200)
+            resp = json.loads(raw)
+            self.assertTrue(resp["ok"])
+            self.assertEqual(resp["mode"], "live")
+            self.assertTrue(resp["live_mode_confirmed"])
+
+            # 6) Balance endpoint returns USD + reserve telemetry
+            status, bal_raw = self._req("/api/wallets/balance")
+            self.assertEqual(status, 200)
+            bal = json.loads(bal_raw)
+            self.assertEqual(bal["sol_balance"], 0.5)
+            self.assertEqual(bal["gas_reserved_sol"], 0.02)
+
+            # 7) Disconnect disarms Live Mode back to paper
+            status, _ = self._req("/api/wallets/disconnect", method="POST", body={})
+            self.assertEqual(status, 200)
+            self.assertEqual(eng.mode, "paper")
+            self.assertFalse(eng.live_mode_confirmed)
+        finally:
+            eng.bridge.refresh_sol_balance = orig_refresh
+
 
 class TestExistingChromeRelayAndGuiImports(unittest.TestCase):
     def test_chrome_profile_discovery_from_local_state(self):
@@ -259,20 +323,26 @@ class TestExistingChromeRelayAndGuiImports(unittest.TestCase):
     def test_local_phantom_relay_connect_and_sign_roundtrip(self):
         tmpdir = tempfile.mkdtemp()
         bridge = phantom_bridge.PhantomBrowserBridge(profile_dir=tmpdir, connection_mode="existing_chrome")
+        bridge.refresh_sol_balance = lambda *a, **kw: 1.25
         try:
             url = bridge._relay.url()
             base = url.rsplit("/", 1)[0]
 
             # Simulate existing Chrome tab reporting connected Phantom wallet
             req = urllib.request.Request(
-                f"{base}/api/relay/connected",
-                data=json.dumps({"publicKey": "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d"}).encode("utf-8"),
+                f"{base}/api/wallets/connect",
+                data=json.dumps({
+                    "address": "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d",
+                    "signing_available": True,
+                    "is_read_only": False,
+                }).encode("utf-8"),
                 headers={"Content-Type": "application/json"},
                 method="POST",
             )
             with urllib.request.urlopen(req, timeout=4) as r:
                 self.assertEqual(r.status, 200)
             self.assertTrue(bridge.connected_once)
+            self.assertTrue(bridge.signing_available)
             self.assertEqual(bridge.status, "connected")
 
             # Simulate signing job submitted by Python & completed by existing Chrome tab
@@ -291,11 +361,58 @@ class TestExistingChromeRelayAndGuiImports(unittest.TestCase):
 
             t = threading.Thread(target=simulate_browser_tab, daemon=True)
             t.start()
-            sig, err = bridge._relay.submit_sign_job("AQAB", side="BUY", timeout_sec=5.0)
+            sig, err = bridge.submit_sign_job_to_browser("AQAB", side="BUY", timeout_sec=5.0)
             self.assertIsNone(err)
             self.assertEqual(sig, "5TestRelaySigXYZ")
         finally:
             bridge.close()
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_confirm_and_verify_parsed_transaction(self):
+        tmpdir = tempfile.mkdtemp()
+        try:
+            bridge = phantom_bridge.PhantomBrowserBridge(profile_dir=tmpdir)
+            pubkey = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d"
+            mint = "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU"
+
+            class _FakeResp:
+                def __init__(self, data):
+                    self.status_code = 200
+                    self._data = data
+
+                def json(self):
+                    return self._data
+
+            class _FakeHttp:
+                def post(self, url, json=None, timeout=5):
+                    method = (json or {}).get("method")
+                    if method == "getSignatureStatuses":
+                        return _FakeResp({"result": {"value": [{"confirmationStatus": "confirmed", "err": None}]}})
+                    if method == "getParsedTransaction":
+                        return _FakeResp({
+                            "result": {
+                                "transaction": {"message": {"accountKeys": [{"pubkey": pubkey}]}},
+                                "meta": {
+                                    "fee": 5000,
+                                    "preBalances": [1_000_000_000],
+                                    "postBalances": [949_995_000],
+                                    "preTokenBalances": [],
+                                    "postTokenBalances": [
+                                        {"owner": pubkey, "mint": mint, "uiTokenAmount": {"uiAmount": 420.5}}
+                                    ],
+                                },
+                            }
+                        })
+                    return _FakeResp({})
+
+            bridge._http = _FakeHttp()
+            verified = bridge.confirm_and_verify_transaction("5TxSig123", target_mint=mint, user_pubkey=pubkey)
+            self.assertTrue(verified["confirmed"])
+            self.assertEqual(verified["explorer_url"], "https://solscan.io/tx/5TxSig123")
+            self.assertAlmostEqual(verified["actual_tokens_received"], 420.5, places=4)
+            self.assertAlmostEqual(verified["actual_sol_spent"], 0.05, places=6)
+            self.assertEqual(verified["fee_lamports"], 5000)
+        finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
     def test_gui_module_has_required_imports(self):

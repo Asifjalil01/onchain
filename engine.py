@@ -20,6 +20,7 @@ SETTINGS = [
     ("trading_mode", "Trading mode ('paper' or 'live')", "str"),
     ("live_trade_size_sol", "Live trade size (SOL)", "float"),
     ("live_max_sol_per_trade", "Live safety cap (max SOL/trade)", "float"),
+    ("gas_reserved_sol", "Gas reserve (SOL kept for tx fees)", "float"),
     ("live_dry_run", "Live dry-run (quote only, no Phantom tx)", "bool"),
     ("phantom_connection_mode", "Phantom mode ('existing_chrome', 'cdp_attach', 'isolated_profile')", "str"),
     ("phantom_chrome_profile", "Existing Chrome profile (e.g. Default, Profile 1)", "str"),
@@ -65,6 +66,7 @@ SETTINGS = [
 LIMITS = {
     "live_trade_size_sol": (0.001, 50.0),
     "live_max_sol_per_trade": (0.001, 100.0),
+    "gas_reserved_sol": (0.001, 1.0),
     "phantom_cdp_port": (1024, 65535),
     "start_balance_usd": (1, 1e7),
     "trade_size_usd": (0.5, 1e6),
@@ -202,6 +204,7 @@ def position_rows(acct, prices):
             "dex": p.get("dex", "?"),
             "source": p.get("source", "?"),
             "tx_sig": p.get("tx_sig", ""),
+            "explorer_url": p.get("explorer_url", ""),
         })
     return rows
 
@@ -276,12 +279,16 @@ class SniperEngine:
             connection_mode=bot.CONFIG.get("phantom_connection_mode", "existing_chrome"),
             chrome_profile=bot.CONFIG.get("phantom_chrome_profile", "Default"),
             cdp_port=bot.CONFIG.get("phantom_cdp_port", 9222),
+            gas_reserved_sol=bot.CONFIG.get("gas_reserved_sol", 0.02),
             log_fn=self._emit_log,
         )
-        self.mode = bot.CONFIG.get("trading_mode", "paper")
+        # Always start safely in Paper Mode until user explicitly unlocks Live Mode via ENABLE LIVE
+        self.live_mode_confirmed = False
+        self.mode = "paper"
+        bot.CONFIG["trading_mode"] = "paper"
         self.paper_acct = bot.PaperAccount(bot.CONFIG, stream_mgr=self.stream_mgr)
         self.live_acct = bot.LiveAccount(bot.CONFIG, self.bridge, stream_mgr=self.stream_mgr)
-        self.acct = self.live_acct if self.mode == "live" else self.paper_acct
+        self.acct = self.paper_acct
 
         self.prices = {}
         self.last_price_time = 0.0
@@ -310,25 +317,77 @@ class SniperEngine:
             items = list(self.logs)
         return items[-limit:]
 
-    def set_mode(self, mode):
+    def validate_live_readiness(self):
+        """Enforce all Phantom wallet, signing capability, and SOL + gas reserve safety checks."""
+        if not self.bridge or not self.bridge.connected_once or not self.bridge.wallet_address:
+            return False, "No Phantom wallet connected. Click 'Connect Phantom Wallet' first."
+        if self.bridge.is_read_only or not self.bridge.signing_available:
+            return False, "Connected wallet is read-only. Connect Phantom browser extension for signing."
+        trade_sol = float(bot.CONFIG.get("live_trade_size_sol", 0.05))
+        max_sol = float(bot.CONFIG.get("live_max_sol_per_trade", 0.25))
+        gas_reserve = float(bot.CONFIG.get("gas_reserved_sol", 0.02))
+        if trade_sol <= 0 or trade_sol > max_sol:
+            return False, f"Live trade size ({trade_sol} SOL) exceeds safety cap ({max_sol} SOL)."
+        if self.bridge.sol_balance < (trade_sol + gas_reserve):
+            return (
+                False,
+                f"Insufficient SOL balance ({self.bridge.sol_balance:.4f} SOL). "
+                f"Need at least {trade_sol + gas_reserve:.4f} SOL ({trade_sol:g} trade + {gas_reserve:g} gas reserve).",
+            )
+        return True, "ok"
+
+    def confirm_enable_live_mode(self, confirmation_text=""):
+        """
+        Safety gate for switching into LIVE MODE:
+        1) Stops any running bot first.
+        2) Requires user to explicitly type ENABLE LIVE.
+        3) Blocks if Phantom is disconnected, read-only, or below tradeAmountSol + gasReserveSol.
+        """
+        if self.running:
+            self.stop_bot()
+
+        normalized = " ".join(str(confirmation_text or "").strip().upper().split())
+        if normalized != "ENABLE LIVE":
+            return False, "Confirmation rejected: you must explicitly type ENABLE LIVE to unlock real trading."
+
+        ok, why = self.validate_live_readiness()
+        if not ok:
+            return False, why
+
+        self.live_mode_confirmed = True
+        return self.set_mode("live", confirmed=True)
+
+    def set_mode(self, mode, confirmed=False):
         mode = str(mode).lower().strip()
         if mode not in ("paper", "live"):
             return False, "Mode must be 'paper' or 'live'"
         if self.running:
-            return False, "Stop the bot before switching trading mode."
-        self.mode = mode
-        bot.CONFIG["trading_mode"] = mode
-        save_settings()
+            self.stop_bot()
         if mode == "live":
+            if not (self.live_mode_confirmed or confirmed):
+                return False, "Live Mode requires typing 'ENABLE LIVE' in the Live confirmation dialog."
+            ok, why = self.validate_live_readiness()
+            if not ok:
+                self.live_mode_confirmed = False
+                return False, why
+            self.live_mode_confirmed = True
+            self.mode = "live"
+            bot.CONFIG["trading_mode"] = "live"
+            save_settings()
             self.live_acct.sync_wallet_cash()
             self.acct = self.live_acct
-            bot.log("Switched to LIVE MODE (Phantom Browser-Once execution armed).")
-        else:
-            self.acct = self.paper_acct
-            bot.log("Switched to PAPER MODE (safe simulated funds).")
-        return True, f"Active mode: {mode.upper()}"
+            bot.log("Switched to LIVE MODE (Phantom Browser Popup execution armed).")
+            return True, "Active mode: LIVE (Phantom confirmation active)"
 
-    def connect_phantom_once(self, wallet_hint="", chrome_profile=None, connection_mode=None):
+        self.live_mode_confirmed = False
+        self.mode = "paper"
+        bot.CONFIG["trading_mode"] = "paper"
+        save_settings()
+        self.acct = self.paper_acct
+        bot.log("Switched to PAPER MODE (safe simulated funds).")
+        return True, "Active mode: PAPER"
+
+    def connect_phantom_once(self, wallet_hint="", chrome_profile=None, connection_mode=None, dashboard_url=None):
         if chrome_profile:
             bot.CONFIG["phantom_chrome_profile"] = chrome_profile
         if connection_mode:
@@ -341,10 +400,20 @@ class SniperEngine:
         self.bridge.connection_mode = bot.CONFIG.get("phantom_connection_mode", "existing_chrome")
         self.bridge.chrome_profile = bot.CONFIG.get("phantom_chrome_profile", "Default")
         self.bridge.cdp_port = int(bot.CONFIG.get("phantom_cdp_port", 9222))
-        ok, msg = self.bridge.connect_once(wallet_hint=wallet_hint)
+        self.bridge.gas_reserved_sol = float(bot.CONFIG.get("gas_reserved_sol", 0.02))
+        ok, msg = self.bridge.connect_once(wallet_hint=wallet_hint, dashboard_url=dashboard_url)
         if ok:
             self.live_acct.sync_wallet_cash()
         return ok, msg
+
+    def disconnect_phantom(self):
+        if self.running and self.mode == "live":
+            self.stop_bot()
+        self.live_mode_confirmed = False
+        if self.mode == "live":
+            self.set_mode("paper")
+        self.bridge.disconnect_wallet()
+        return True, "Phantom wallet disconnected and Live Mode disarmed."
 
     def close_phantom_browser(self):
         self.bridge.close()
@@ -363,8 +432,12 @@ class SniperEngine:
     def start(self):
         if self.running:
             return False, "Already running"
-        if self.mode == "live" and (not self.bridge.connected_once or not self.bridge.wallet_address):
-            return False, "Live Mode requires Phantom connection first ('Connect Phantom Once')."
+        if self.mode == "live":
+            if not self.live_mode_confirmed:
+                return False, "Live Mode requires explicit confirmation ('ENABLE LIVE') first."
+            ok, why = self.validate_live_readiness()
+            if not ok:
+                return False, why
 
         stop = threading.Event()
         self._stop = stop
@@ -461,6 +534,7 @@ class SniperEngine:
         return {
             "running": self.running,
             "mode": self.mode,
+            "live_mode_confirmed": self.live_mode_confirmed,
             "last_price_age_sec": round(time.time() - self.last_price_time, 1) if self.last_price_time else None,
             "stats": stats,
             "positions": rows,

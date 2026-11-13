@@ -36,6 +36,7 @@ CONFIG = {
     "trading_mode": "paper",  # "paper" or "live"
     "live_trade_size_sol": 0.05,
     "live_max_sol_per_trade": 0.25,
+    "gas_reserved_sol": 0.02,
     "live_dry_run": False,
     "phantom_connection_mode": "existing_chrome",  # "existing_chrome" | "cdp_attach" | "isolated_profile"
     "phantom_chrome_profile": "Default",
@@ -645,14 +646,17 @@ class LiveAccount(PaperAccount):
         c = self.cfg
         if not self.bridge or not self.bridge.connected_once or not self.bridge.wallet_address:
             return False, "phantom not connected"
+        if not c.get("live_dry_run", False) and (self.bridge.is_read_only or not self.bridge.signing_available):
+            return False, "wallet is read-only (browser signing unavailable)"
         if len(self.state["positions"]) >= c["max_open_positions"]:
             return False, "max positions"
         trade_sol = float(c.get("live_trade_size_sol", 0.05))
         max_sol = float(c.get("live_max_sol_per_trade", 0.25))
+        gas_reserve = float(c.get("gas_reserved_sol", getattr(self.bridge, "gas_reserved_sol", 0.02)))
         if trade_sol <= 0 or trade_sol > max_sol:
             return False, "trade SOL exceeds cap"
-        if not c.get("live_dry_run", False) and self.bridge.sol_balance < (trade_sol + 0.005):
-            return False, "insufficient SOL"
+        if not c.get("live_dry_run", False) and self.bridge.sol_balance < (trade_sol + gas_reserve):
+            return False, f"insufficient SOL ({self.bridge.sol_balance:.4f} < {trade_sol + gas_reserve:.4f} incl. gas reserve)"
         if self.state["day_pnl"] <= -c["daily_loss_limit_usd"]:
             return False, "daily loss limit"
         return True, "ok"
@@ -678,10 +682,13 @@ class LiveAccount(PaperAccount):
             return False
 
         sol_usd = self._sol_price()
-        cost_usd = trade_sol * sol_usd
-        qty_est = cost_usd / max(price, 1e-12)
+        actual_sol = res.get("actual_sol_delta")
+        cost_sol = float(actual_sol) if (actual_sol is not None and float(actual_sol) > 0) else trade_sol
+        cost_usd = cost_sol * sol_usd
+        qty_est = float(res["actual_tokens_out"]) if res.get("actual_tokens_out") else (cost_usd / max(price, 1e-12))
         out_raw = int(res.get("out_amount") or 0)
         sig = res.get("signature", "")
+        explorer_url = res.get("explorer_url") or (f"https://solscan.io/tx/{sig}" if sig and not dry_run else "")
 
         self.sync_wallet_cash()
         self.state["positions"][mint] = {
@@ -690,7 +697,7 @@ class LiveAccount(PaperAccount):
             "raw_amount": out_raw,
             "entry_price": price,
             "cost": cost_usd,
-            "cost_sol": trade_sol,
+            "cost_sol": cost_sol,
             "opened": time.time(),
             "url": url,
             "peak_price": price,
@@ -699,13 +706,16 @@ class LiveAccount(PaperAccount):
             "source": meta.get("source", "?"),
             "age_at_entry": round(meta.get("age_s", 0), 1),
             "tx_sig": sig,
+            "explorer_url": explorer_url,
+            "fee_lamports": res.get("fee_lamports"),
         }
         self.state["blacklist"].append(mint)
         self._log_trade([
             now().isoformat(), "LIVE_BUY", symbol, mint, fmt_price(price), round(cost_usd, 2), "", "",
             f"phantom:{sig[:12]}", url, meta.get("age_s", 0), meta.get("dex", "?"), meta.get("source", "?"),
         ])
-        log(f"✓ LIVE SNIPER BUY {symbol} sig={sig[:16]}... @ ${fmt_price(price)}")
+        link_txt = f" ({explorer_url})" if explorer_url else ""
+        log(f"✓ LIVE SNIPER BUY {symbol} sig={sig[:16]}... @ ${fmt_price(price)}{link_txt}")
         if self.stream_mgr:
             self.stream_mgr.subscribe_token(mint)
         self.save()
@@ -719,7 +729,6 @@ class LiveAccount(PaperAccount):
             return
         raw_amount = int(pos.get("raw_amount") or 0)
         if raw_amount <= 0:
-            # Estimate raw units (6 decimals default for pump/spl) if dry run quote omitted it
             raw_amount = max(1, int(pos["qty"] * 1_000_000))
         slippage_bps = int(float(c.get("slippage_pct", 2.0)) * 100)
         dry_run = bool(c.get("live_dry_run", False))
@@ -731,7 +740,8 @@ class LiveAccount(PaperAccount):
 
         self.state["positions"].pop(mint, None)
         sol_usd = self._sol_price()
-        out_sol = int(res.get("out_amount") or 0) / LAMPORTS_PER_SOL
+        actual_sol = res.get("actual_sol_delta")
+        out_sol = float(actual_sol) if (actual_sol is not None and float(actual_sol) > 0) else (int(res.get("out_amount") or 0) / LAMPORTS_PER_SOL)
         proceeds = (out_sol * sol_usd) if out_sol > 0 else (pos["qty"] * price)
         pnl = proceeds - pos["cost"]
         pnl_pct = pnl / max(pos["cost"], 1e-9) * 100
@@ -743,11 +753,13 @@ class LiveAccount(PaperAccount):
         if pnl > 0:
             self.state["wins"] += 1
         sig = res.get("signature", "")
+        explorer_url = res.get("explorer_url") or (f"https://solscan.io/tx/{sig}" if sig and not dry_run else "")
         self._log_trade([
             now().isoformat(), "LIVE_SELL", pos["symbol"], mint, fmt_price(price),
             round(proceeds, 2), round(pnl, 4), round(pnl_pct, 2), f"{reason}:{sig[:10]}", pos.get("url", ""),
         ])
-        log(f"✗ LIVE SELL {pos['symbol']} @ ${fmt_price(price)} pnl ${pnl:.2f} ({pnl_pct:.1f}%) [{reason}]")
+        link_txt = f" ({explorer_url})" if explorer_url else ""
+        log(f"✗ LIVE SELL {pos['symbol']} @ ${fmt_price(price)} pnl ${pnl:.2f} ({pnl_pct:.1f}%) [{reason}]{link_txt}")
         if self.stream_mgr:
             self.stream_mgr.unsubscribe_token(mint)
         self.save()
@@ -951,6 +963,7 @@ def run(once=False, live=False):
             connection_mode=CONFIG.get("phantom_connection_mode", "existing_chrome"),
             chrome_profile=CONFIG.get("phantom_chrome_profile", "Default"),
             cdp_port=CONFIG.get("phantom_cdp_port", 9222),
+            gas_reserved_sol=CONFIG.get("gas_reserved_sol", 0.02),
             log_fn=log,
         )
         if not bridge.connected_once:

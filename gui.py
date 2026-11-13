@@ -14,9 +14,9 @@ import webbrowser
 
 try:
     import tkinter as tk
-    from tkinter import messagebox, ttk
+    from tkinter import messagebox, simpledialog, ttk
 except ImportError:
-    tk = ttk = messagebox = None
+    tk = ttk = messagebox = simpledialog = None
 
 import bot
 from phantom_bridge import list_chrome_profiles
@@ -266,7 +266,8 @@ class App:
         row.pack(fill="x", padx=14, pady=(0, 12))
         ttk.Button(row, text="Connect Phantom (Once)", command=self.connect_phantom).pack(side="left")
         ttk.Button(row, text="Refresh SOL Balance", command=self.refresh_phantom).pack(side="left", padx=8)
-        ttk.Button(row, text="Close Bridge", command=self.engine.close_phantom_browser).pack(side="left")
+        ttk.Button(row, text="Disconnect Phantom", command=self.disconnect_phantom).pack(side="left")
+        ttk.Button(row, text="Close Bridge", command=self.engine.close_phantom_browser).pack(side="left", padx=8)
 
     def build_settings(self, parent):
         canvas = tk.Canvas(parent, bg=BG, highlightthickness=0)
@@ -327,14 +328,24 @@ class App:
     def toggle_mode(self):
         target = "live" if self.engine.mode == "paper" else "paper"
         if target == "live":
-            if not messagebox.askyesno(
-                "Switch to LIVE MODE",
-                "LIVE MODE executes real swaps via your Phantom Browser-Once session.\n"
-                f"Trade size: {bot.CONFIG['live_trade_size_sol']} SOL (max {bot.CONFIG['live_max_sol_per_trade']} SOL).\n\n"
-                "Switch to LIVE MODE?",
-            ):
+            if self.engine.running:
+                self.engine.stop_bot()
+            prompt = (
+                "LIVE MODE executes real swaps on Solana Mainnet using Phantom.\n"
+                f"Trade size: {bot.CONFIG['live_trade_size_sol']} SOL | "
+                f"Gas reserve: {bot.CONFIG.get('gas_reserved_sol', 0.02)} SOL.\n\n"
+                "Type ENABLE LIVE below to confirm and unlock Live Mode:"
+            )
+            typed = simpledialog.askstring("Switch to LIVE MODE", prompt, parent=self.root)
+            if typed is None:
                 return
-        ok, msg = self.engine.set_mode(target)
+            ok, msg = self.engine.confirm_enable_live_mode(typed)
+            if not ok:
+                messagebox.showwarning("Live Mode blocked", msg)
+            self.say(msg, 6000)
+            return
+
+        ok, msg = self.engine.set_mode("paper")
         if not ok:
             messagebox.showwarning("Mode switch", msg)
         self.say(msg)
@@ -348,11 +359,15 @@ class App:
             self.root.after(0, lambda: self.say(msg, 6000))
         threading.Thread(target=worker, daemon=True).start()
 
+    def disconnect_phantom(self):
+        ok, msg = self.engine.disconnect_phantom()
+        self.say(msg)
+
     def refresh_phantom(self):
         def worker():
             bal = self.engine.bridge.refresh_sol_balance()
             self.engine.live_acct.sync_wallet_cash()
-            self.root.after(0, lambda: self.say(f"Wallet SOL balance: {bal:.4f} SOL"))
+            self.root.after(0, lambda: self.say(f"Wallet SOL balance: {bal:.4f} SOL (${self.engine.bridge.balance_usd:.2f})"))
         threading.Thread(target=worker, daemon=True).start()
 
     def chosen_key(self, tv, col):
@@ -392,8 +407,11 @@ class App:
             return
         bot.CONFIG.update(parsed)
         save_settings()
-        if parsed.get("trading_mode") != self.engine.mode and not self.engine.running:
-            self.engine.set_mode(parsed["trading_mode"])
+        if parsed.get("trading_mode") == "paper" and self.engine.mode != "paper" and not self.engine.running:
+            self.engine.set_mode("paper")
+        elif parsed.get("trading_mode") == "live" and self.engine.mode != "live":
+            bot.CONFIG["trading_mode"] = "paper"
+            messagebox.showinfo("Live Mode Gate", "Use 'Mode: PAPER' button and type ENABLE LIVE to unlock Live Mode.")
         self.fill_settings()
         self.say("Settings applied and saved.")
 
@@ -496,15 +514,17 @@ class App:
         ph = self.engine.bridge.get_status()
         addr = f"{ph['wallet_address'][:6]}...{ph['wallet_address'][-4:]}" if ph["wallet_address"] else "not connected"
         self.phantom_lbl.config(
-            text=f"Phantom [{ph['status']}]: {addr} | {ph['sol_balance']:.4f} SOL | driver={ph['driver']}",
+            text=f"Phantom [{ph['status']}]: {addr} | {ph['sol_balance']:.4f} SOL (${ph.get('balance_usd', 0):.2f}) | driver={ph['driver']}",
             fg=GREEN if ph["connected_once"] else GREY,
         )
         self.ph_detail.config(
             text=(
-                f"Status:          {ph['status']}\n"
+                f"Status:          {ph['status']} (live_armed={self.engine.live_mode_confirmed})\n"
                 f"Connected once:  {ph['connected_once']}\n"
                 f"Wallet address:  {ph['wallet_address'] or '(none yet)'}\n"
-                f"SOL balance:     {ph['sol_balance']:.6f} SOL\n"
+                f"SOL balance:     {ph['sol_balance']:.6f} SOL (${ph.get('balance_usd', 0):.2f} USD)\n"
+                f"Gas reserve:     {ph.get('gas_reserved_sol', 0.02):.4f} SOL | signing={ph.get('signing_available')} | read_only={ph.get('is_read_only')}\n"
+                f"Solana RPC:      {ph.get('rpc_endpoint', '-')}\n"
                 f"Mode / Profile:  {ph['connection_mode']} (Chrome profile='{ph['chrome_profile']}')\n"
                 f"Bridge driver:   {ph['driver']} (relay_alive={ph.get('relay_tab_alive')}, active={ph['browser_active']})\n"
                 f"Relay URL:       {ph.get('relay_url') or '(starts on connect)'}\n"

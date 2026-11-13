@@ -1,22 +1,21 @@
 #!/usr/bin/env python3
 """
-Pure-Python Phantom Wallet Browser-Once Automation Bridge.
+Pure-Python Phantom Wallet Browser Integration & Live Swap Bridge.
 
-Supports three connection modes:
-1. `existing_chrome` (DEFAULT):
-   - First checks if Chrome is already running with a CDP debug port (`9222` or custom)
-     and attaches directly to it (zero new windows, full auto-confirm).
-   - Otherwise, starts a local Python Phantom Relay (`http://127.0.0.1:<port>/`) and
-     opens a tab inside the user's ALREADY-OPEN Chrome browser & existing profile
-     (e.g. `Default` or `Profile 1`) — NO brand-new Chrome profile, NO `jup.ag` redirect.
-   - The open tab connects to the user's already-unlocked `window.phantom.solana`
-     once and stays open to sign & send live swap transactions on demand.
-2. `cdp_attach`:
-   - Attaches strictly to an already-open Chrome/Chromium running with
-     `--remote-debugging-port=<cdp_port>`.
-3. `isolated_profile`:
-   - Launches a dedicated persistent profile directory (`phantom_profile/`) with
-     an unpacked Phantom extension.
+Mirrors the full Phantom Live Wallet architecture in Python:
+1. Browser Extension Detection (`window.phantom?.solana || window.solana` with `isPhantom`):
+   - Silent auto-reconnect (`onlyIfTrusted: true`) + `connect`, `disconnect`, `accountChanged` listeners
+   - Interactive `provider.connect()` popup trigger (or opens https://phantom.app/ if missing)
+   - Never asks for or stores private keys or seed phrases
+2. Live On-Chain Balance & Backend Sync:
+   - Queries `getBalance` (`confirmed` commitment) across fallback Solana Mainnet RPCs
+   - Tracks `gas_reserved_sol` (0.02 SOL), `signing_available`, `is_read_only`, `rpc_endpoint`
+3. Live Swap Execution & On-Chain Parsed Receipt Verification:
+   - Fetches Jupiter v6 quote + VersionedTransaction (`/v6/quote`, `/v6/swap`)
+   - Dispatches serialized transaction to connected browser tab for Phantom popup approval
+     (`signAndSendTransaction` or `signTransaction` + `sendRawTransaction`), handling code 4001 cleanly
+   - Polls `getSignatureStatuses` (`confirmed`/`finalized`) and inspects `getParsedTransaction`
+     for actual SOL delta, actual tokens received, fee lamports, and Solscan explorer URL
 """
 import glob
 import json
@@ -42,11 +41,12 @@ except ImportError:
 
 PHANTOM_EXT_ID = "bfnaelmomeimhlpmgjnjophhpkkoljpa"
 JUP_QUOTE_URLS = [
-    "https://api.jup.ag/swap/v1",
     "https://quote-api.jup.ag/v6",
+    "https://api.jup.ag/swap/v1",
 ]
 SOLANA_RPC_URLS = [
     "https://api.mainnet-beta.solana.com",
+    "https://rpc.ankr.com/solana",
     "https://solana-rpc.publicnode.com",
 ]
 LAMPORTS_PER_SOL = 1_000_000_000
@@ -242,7 +242,7 @@ _RELAY_HTML = """<!doctype html>
     }
     .card {
       background: #121824; border: 1px solid #243047; border-radius: 14px;
-      padding: 24px 28px; max-width: 560px; width: 100%;
+      padding: 24px 28px; max-width: 580px; width: 100%;
     }
     h1 { margin: 0 0 8px; font-size: 20px; }
     p { color: #94a3b8; font-size: 13.5px; line-height: 1.5; }
@@ -252,14 +252,16 @@ _RELAY_HTML = """<!doctype html>
     }
     .ok { border-color: #10b981; color: #6ee7b7; }
     .err { border-color: #ef4444; color: #fca5a5; }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; }
     button {
       background: #6d28d9; color: #fff; border: none; border-radius: 8px;
       padding: 10px 18px; font-size: 14px; font-weight: 600; cursor: pointer;
     }
     button:hover { background: #5b21b6; }
+    button.sec { background: #1e293b; border: 1px solid #334155; }
     .log {
       margin-top: 14px; background: #080b11; border: 1px solid #1f2937;
-      border-radius: 8px; padding: 10px; height: 140px; overflow-y: auto;
+      border-radius: 8px; padding: 10px; height: 160px; overflow-y: auto;
       font-family: monospace; font-size: 12px; color: #94a3b8;
     }
   </style>
@@ -268,14 +270,22 @@ _RELAY_HTML = """<!doctype html>
 <body>
   <div class="card">
     <h1>Solana Sniper &mdash; Phantom Browser Bridge</h1>
-    <p>Keep this tab open in your Chrome profile. Your already-unlocked Phantom extension connects once here and signs live swaps requested by the Python sniper bot.</p>
-    <div id="status" class="status">Detecting Phantom extension...</div>
-    <button id="btn-connect" type="button" onclick="connectWallet(false)">Connect Phantom</button>
+    <p>Uses your existing Chrome profile's Phantom browser extension (no private keys stored). Keep this tab open to approve and sign live swaps directly in Phantom.</p>
+    <div id="status" class="status">Detecting window.phantom?.solana...</div>
+    <div class="row">
+      <button id="btn-connect" type="button" onclick="connectPhantomBrowser()">Connect Phantom Wallet</button>
+      <button id="btn-disconnect" type="button" class="sec" onclick="disconnectPhantom()">Disconnect</button>
+    </div>
     <div id="log" class="log"></div>
   </div>
   <script>
     const statusEl = document.getElementById('status');
     const logEl = document.getElementById('log');
+    const RPC_LIST = [
+      'https://api.mainnet-beta.solana.com',
+      'https://rpc.ankr.com/solana',
+      'https://solana-rpc.publicnode.com'
+    ];
     let connectedPubkey = null;
     let busyJob = false;
 
@@ -287,40 +297,109 @@ _RELAY_HTML = """<!doctype html>
     }
 
     function getProvider() {
-      if (window.phantom && window.phantom.solana && window.phantom.solana.isPhantom) return window.phantom.solana;
-      if (window.solana && window.solana.isPhantom) return window.solana;
-      return null;
+      const p = (window.phantom && window.phantom.solana) || window.solana;
+      return (p && p.isPhantom) ? p : null;
     }
 
-    async function connectWallet(onlyIfTrusted) {
-      const provider = getProvider();
-      if (!provider) {
+    function bindListeners() {
+      const p = getProvider();
+      if (!p || !p.on || p.__sniperBound) return;
+      p.__sniperBound = true;
+      try {
+        p.on('connect', async (pk) => {
+          const addr = pk && pk.toString ? pk.toString() : null;
+          if (addr) await onWalletConnected(addr);
+        });
+        p.on('disconnect', async () => {
+          await onWalletDisconnected();
+        });
+        p.on('accountChanged', async (pk) => {
+          if (pk && pk.toString) await onWalletConnected(pk.toString());
+          else await onWalletDisconnected();
+        });
+      } catch {}
+    }
+
+    async function onWalletConnected(addr) {
+      connectedPubkey = addr;
+      statusEl.className = 'status ok';
+      statusEl.textContent = `Connected: ${addr}`;
+      await fetch('/api/wallets/connect', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chain: 'solana',
+          wallet_id: 'phantom',
+          name: 'Phantom Wallet',
+          type: 'solana',
+          address: addr,
+          signing_available: true,
+          is_read_only: false,
+          network: 'Solana Mainnet-Beta'
+        })
+      });
+      addLog(`Synced Phantom address ${addr} to Python backend`);
+    }
+
+    async function onWalletDisconnected() {
+      connectedPubkey = null;
+      statusEl.className = 'status';
+      statusEl.textContent = 'Phantom disconnected.';
+      await fetch('/api/wallets/disconnect', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chain: 'solana' })
+      }).catch(() => {});
+      addLog('Phantom disconnected');
+    }
+
+    async function attemptAutoReconnect() {
+      const p = getProvider();
+      if (!p) return false;
+      try {
+        if (p.isConnected && p.publicKey) {
+          await onWalletConnected(p.publicKey.toString());
+          return true;
+        }
+        const resp = await p.connect({ onlyIfTrusted: true });
+        if (resp && resp.publicKey) {
+          await onWalletConnected(resp.publicKey.toString());
+          return true;
+        }
+      } catch {}
+      return false;
+    }
+
+    async function connectPhantomBrowser() {
+      const p = getProvider();
+      if (!p) {
         statusEl.className = 'status err';
-        statusEl.textContent = 'Phantom extension not found in this Chrome profile. Unlock or install Phantom, then click Connect Phantom.';
-        return null;
+        statusEl.textContent = 'Phantom extension not found in this Chrome profile. Opening https://phantom.app/...';
+        addLog('Phantom extension missing — opening phantom.app');
+        window.open('https://phantom.app/', '_blank', 'noopener,noreferrer');
+        return false;
       }
       try {
-        const resp = await provider.connect(onlyIfTrusted ? { onlyIfTrusted: true } : undefined);
-        const pubkey = resp.publicKey.toString();
-        connectedPubkey = pubkey;
-        statusEl.className = 'status ok';
-        statusEl.textContent = `Connected to Phantom: ${pubkey}`;
-        document.getElementById('btn-connect').textContent = 'Reconnect Phantom';
-        await fetch('/api/relay/connected', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ publicKey: pubkey }),
-        });
-        addLog(`Wallet connected: ${pubkey}`);
-        return pubkey;
-      } catch (e) {
-        if (!onlyIfTrusted) {
-          statusEl.className = 'status err';
-          statusEl.textContent = 'Connection declined or Phantom locked: ' + (e.message || e);
-          addLog('Connect error: ' + (e.message || e));
+        const resp = await p.connect();
+        const addr = (resp && resp.publicKey && resp.publicKey.toString()) || (p.publicKey && p.publicKey.toString());
+        if (addr) {
+          await onWalletConnected(addr);
+          return true;
         }
-        return null;
+      } catch (err) {
+        statusEl.className = 'status err';
+        statusEl.textContent = (err && err.code === 4001)
+          ? 'Connection declined in Phantom popup.'
+          : 'Connect error: ' + ((err && err.message) || err);
+        addLog(statusEl.textContent);
       }
+      return false;
+    }
+
+    async function disconnectPhantom() {
+      const p = getProvider();
+      try { if (p && p.disconnect) await p.disconnect(); } catch {}
+      await onWalletDisconnected();
     }
 
     function b64ToBytes(b64) {
@@ -330,10 +409,31 @@ _RELAY_HTML = """<!doctype html>
       return out;
     }
 
+    async function sendRawViaRpc(rawBytes) {
+      let b64 = '';
+      for (let i = 0; i < rawBytes.length; i++) b64 += String.fromCharCode(rawBytes[i]);
+      const encoded = btoa(b64);
+      for (const rpc of RPC_LIST) {
+        try {
+          const r = await fetch(rpc, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              jsonrpc: '2.0', id: 1, method: 'sendTransaction',
+              params: [encoded, { encoding: 'base64', skipPreflight: false, preflightCommitment: 'confirmed', maxRetries: 3 }]
+            })
+          });
+          const j = await r.json();
+          if (j && j.result) return j.result;
+        } catch {}
+      }
+      throw new Error('Failed to broadcast signed transaction');
+    }
+
     async function handleSignJob(job) {
-      const provider = getProvider();
-      if (!provider) throw new Error('Phantom provider missing');
-      if (!connectedPubkey) await connectWallet(false);
+      const p = getProvider();
+      if (!p) throw new Error('Phantom provider missing');
+      if (!connectedPubkey) await connectPhantomBrowser();
       const bytes = b64ToBytes(job.tx_b64);
       let txObj;
       if (window.solanaWeb3 && window.solanaWeb3.VersionedTransaction) {
@@ -341,11 +441,13 @@ _RELAY_HTML = """<!doctype html>
       } else {
         txObj = { serialize: () => bytes };
       }
-      addLog(`Signing ${job.side || 'SWAP'} transaction...`);
-      const res = await provider.signAndSendTransaction(txObj);
-      const sig = res.signature || String(res);
-      addLog(`Signed & sent! sig=${sig}`);
-      return sig;
+      addLog(`Opening Phantom popup to approve ${job.side || 'SWAP'}...`);
+      if (typeof p.signAndSendTransaction === 'function') {
+        const res = await p.signAndSendTransaction(txObj, { skipPreflight: false, maxRetries: 3 });
+        return res.signature || String(res);
+      }
+      const signedTx = await p.signTransaction(txObj);
+      return await sendRawViaRpc(signedTx.serialize());
     }
 
     async function pollJobs() {
@@ -358,17 +460,20 @@ _RELAY_HTML = """<!doctype html>
               busyJob = true;
               try {
                 const sig = await handleSignJob(job);
+                addLog(`Approved & broadcast! sig=${sig}`);
                 await fetch('/api/relay/result', {
                   method: 'POST',
                   headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({ id: job.id, ok: true, signature: sig }),
+                  body: JSON.stringify({ id: job.id, ok: true, signature: sig })
                 });
               } catch (err) {
-                addLog('Sign failed: ' + (err.message || err));
+                const isReject = (err && err.code === 4001) || String((err && err.message) || err).toLowerCase().includes('reject');
+                const msg = isReject ? 'User declined transaction in Phantom (code 4001).' : String((err && err.message) || err);
+                addLog(msg);
                 await fetch('/api/relay/result', {
                   method: 'POST',
                   headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({ id: job.id, ok: false, error: String(err.message || err) }),
+                  body: JSON.stringify({ id: job.id, ok: false, rejected: isReject, error: msg })
                 });
               } finally {
                 busyJob = false;
@@ -377,18 +482,21 @@ _RELAY_HTML = """<!doctype html>
           }
         } catch {}
       }
-      setTimeout(pollJobs, 350);
+      setTimeout(pollJobs, 300);
     }
 
     window.addEventListener('load', async () => {
       setTimeout(async () => {
-        const pub = await connectWallet(true);
-        if (!pub) {
-          statusEl.textContent = 'Phantom detected — approve connection once or click "Connect Phantom".';
-          await connectWallet(false);
+        bindListeners();
+        const reconnected = await attemptAutoReconnect();
+        if (!reconnected) {
+          const p = getProvider();
+          statusEl.textContent = p
+            ? 'Phantom detected — click "Connect Phantom Wallet" to approve.'
+            : 'Phantom extension not detected in this browser.';
         }
         pollJobs();
-      }, 350);
+      }, 250);
     });
   </script>
 </body>
@@ -398,23 +506,19 @@ _RELAY_HTML = """<!doctype html>
 
 class _LocalPhantomRelay:
     """
-    Lightweight pure-Python HTTP server that bridges the user's already-open Chrome
-    tab (`window.phantom.solana`) directly with Python `PhantomBrowserBridge`.
+    Lightweight pure-Python HTTP server used when connecting from Desktop GUI (`gui.py`).
+    Bridges the user's existing Chrome tab directly with `PhantomBrowserBridge`.
     """
 
-    def __init__(self, on_connected_cb):
-        self.on_connected_cb = on_connected_cb
-        self._lock = threading.Lock()
+    def __init__(self, bridge):
+        self.bridge = bridge
         self._server = None
         self.port = None
-        self.pending_job = None
-        self.job_results = {}
-        self.last_heartbeat = 0.0
 
     def start(self):
         if self._server is not None:
             return self.port
-        relay = self
+        bridge = self.bridge
 
         class RelayHandler(BaseHTTPRequestHandler):
             def log_message(self, fmt, *args):
@@ -449,10 +553,7 @@ class _LocalPhantomRelay:
                     self.wfile.write(body)
                     return
                 if p == "/api/relay/next":
-                    relay.last_heartbeat = time.time()
-                    with relay._lock:
-                        job = relay.pending_job
-                        relay.pending_job = None
+                    job = bridge.pop_pending_sign_job()
                     self._json(job or {})
                     return
                 self._json({}, code=404)
@@ -460,18 +561,24 @@ class _LocalPhantomRelay:
             def do_POST(self):
                 p = urllib.parse.urlparse(self.path).path
                 data = self._read_json()
-                if p == "/api/relay/connected":
-                    relay.last_heartbeat = time.time()
-                    pub = str(data.get("publicKey") or "").strip()
+                if p in ("/api/relay/connected", "/api/wallets/connect"):
+                    pub = str(data.get("address") or data.get("publicKey") or "").strip()
                     if pub:
-                        relay.on_connected_cb(pub)
-                    self._json({"ok": bool(pub)})
+                        bridge.set_connected_wallet(
+                            address=pub,
+                            signing_available=bool(data.get("signing_available", True)),
+                            is_read_only=bool(data.get("is_read_only", False)),
+                            driver="existing_chrome_relay",
+                        )
+                    self._json({"ok": bool(pub), "phantom": bridge.get_status()})
+                    return
+                if p == "/api/wallets/disconnect":
+                    bridge.disconnect_wallet()
+                    self._json({"ok": True})
                     return
                 if p == "/api/relay/result":
                     jid = str(data.get("id") or "")
-                    with relay._lock:
-                        if jid:
-                            relay.job_results[jid] = data
+                    bridge.submit_sign_result(jid, data)
                     self._json({"ok": True})
                     return
                 self._json({}, code=404)
@@ -484,24 +591,6 @@ class _LocalPhantomRelay:
     def url(self):
         port = self.start()
         return f"http://127.0.0.1:{port}/phantom-bridge"
-
-    def is_tab_alive(self, max_age=8.0):
-        return self.last_heartbeat > 0 and (time.time() - self.last_heartbeat) <= max_age
-
-    def submit_sign_job(self, tx_b64, side="BUY", timeout_sec=45.0):
-        job_id = f"job_{int(time.time() * 1000)}"
-        with self._lock:
-            self.pending_job = {"id": job_id, "tx_b64": tx_b64, "side": side}
-        deadline = time.time() + timeout_sec
-        while time.time() < deadline:
-            with self._lock:
-                res = self.job_results.pop(job_id, None)
-            if res is not None:
-                if res.get("ok") and res.get("signature"):
-                    return res["signature"], None
-                return None, res.get("error") or "Phantom rejected transaction"
-            time.sleep(0.25)
-        return None, "Timed out waiting for Phantom relay tab to sign transaction"
 
     def stop(self):
         if self._server is not None:
@@ -516,9 +605,11 @@ class _LocalPhantomRelay:
 
 class PhantomBrowserBridge:
     """
-    Browser-Once Phantom automation controller.
-    Defaults to connecting to the user's EXISTING Chrome browser & profile
-    without creating a brand-new profile or opening external sites.
+    Browser-Once Phantom automation & signing bridge.
+    Works seamlessly with:
+    - Web Dashboard (`http://localhost:3000`) directly via `window.phantom.solana`
+    - Existing Chrome Profile tab (`_LocalPhantomRelay`) for Desktop Tkinter GUI
+    - Existing Chrome CDP attach (`--remote-debugging-port=9222`) for auto-confirm
     """
 
     def __init__(
@@ -532,6 +623,7 @@ class PhantomBrowserBridge:
         connection_mode="existing_chrome",
         chrome_profile="Default",
         cdp_port=9222,
+        gas_reserved_sol=0.02,
         log_fn=None,
     ):
         self.profile_dir = os.path.abspath(profile_dir)
@@ -543,24 +635,36 @@ class PhantomBrowserBridge:
         self.connection_mode = connection_mode or "existing_chrome"
         self.chrome_profile = chrome_profile or "Default"
         self.cdp_port = int(cdp_port or 9222)
+        self.gas_reserved_sol = float(gas_reserved_sol)
         self._log = log_fn or (lambda m: None)
 
         self._http = HttpSession()
         self._lock = threading.RLock()
         self._session_file = os.path.join(self.profile_dir, "phantom_session.json")
 
+        # Shared signing relay queue (consumed by either Web Dashboard tab OR _LocalPhantomRelay tab)
+        self._relay_lock = threading.Lock()
+        self._pending_job = None
+        self._job_results = {}
+        self.last_tab_heartbeat = 0.0
+
         # Runtime handles
         self._pw = None
         self._pw_ctx = None
         self._cdp_proc = None
         self._cdp_port = None
-        self._driver = None  # "existing_chrome_relay" | "cdp_attached" | "cdp" | "playwright" | None
-        self._relay = _LocalPhantomRelay(self._on_relay_connected)
+        self._driver = None
+        self._relay = _LocalPhantomRelay(self)
 
-        # Cached state
-        self.status = "disconnected"
+        # Wallet & RPC state
+        self.status = "disconnected"  # disconnected | connecting | awaiting_unlock | connected | paired_idle | error
         self.wallet_address = ""
         self.sol_balance = 0.0
+        self.balance_usd = 0.0
+        self.sol_price_usd = 180.0
+        self.rpc_endpoint = self.rpc_urls[0]
+        self.signing_available = False
+        self.is_read_only = False
         self.connected_once = False
         self.last_error = ""
         self.last_tx_sig = ""
@@ -569,19 +673,78 @@ class PhantomBrowserBridge:
 
         self._load_session()
 
-    def _on_relay_connected(self, pubkey):
+    # ---------- Shared relay queue methods (used by web_dashboard.py & _LocalPhantomRelay)
+    def mark_tab_heartbeat(self):
+        self.last_tab_heartbeat = time.time()
+
+    def is_tab_alive(self, max_age=8.0):
+        return self.last_tab_heartbeat > 0 and (time.time() - self.last_tab_heartbeat) <= max_age
+
+    def pop_pending_sign_job(self):
+        self.mark_tab_heartbeat()
+        with self._relay_lock:
+            job = self._pending_job
+            self._pending_job = None
+            return job
+
+    def submit_sign_result(self, job_id, result_dict):
+        if not job_id:
+            return
+        with self._relay_lock:
+            self._job_results[job_id] = dict(result_dict or {})
+
+    def submit_sign_job_to_browser(self, tx_b64, side="BUY", timeout_sec=45.0):
+        job_id = f"job_{int(time.time() * 1000)}"
+        with self._relay_lock:
+            self._pending_job = {"id": job_id, "tx_b64": tx_b64, "side": side}
+        deadline = time.time() + timeout_sec
+        while time.time() < deadline:
+            with self._relay_lock:
+                res = self._job_results.pop(job_id, None)
+            if res is not None:
+                if res.get("ok") and res.get("signature"):
+                    return res["signature"], None
+                return None, res.get("error") or "User rejected or Phantom signing failed"
+            time.sleep(0.25)
+        return None, "Timed out waiting for Phantom browser popup approval"
+
+    # ---------- Wallet sync & balance
+    def set_connected_wallet(self, address, signing_available=True, is_read_only=False, driver=None, sol_price_usd=None):
+        addr = str(address or "").strip()
+        if not addr:
+            return
         with self._lock:
-            changed = self.wallet_address != pubkey or not self.connected_once
-            self.wallet_address = pubkey
+            changed = self.wallet_address != addr or not self.connected_once
+            self.wallet_address = addr
             self.connected_once = True
             self.status = "connected"
+            self.signing_available = bool(signing_available)
+            self.is_read_only = bool(is_read_only)
             self.last_error = ""
-            if not self._driver:
-                self._driver = "existing_chrome_relay"
+            if sol_price_usd and sol_price_usd > 1.0:
+                self.sol_price_usd = float(sol_price_usd)
+            if driver:
+                self._driver = driver
+            elif not self._driver:
+                self._driver = "phantom_browser_extension"
+            self.mark_tab_heartbeat()
             self._save_session()
+        self.refresh_sol_balance(sol_price_usd=self.sol_price_usd)
         if changed:
-            self.refresh_sol_balance()
-            self._log(f"Phantom connected in existing Chrome profile ({self.chrome_profile}): {pubkey}")
+            self._log(f"Phantom wallet connected ({self._driver}): {addr} | {self.sol_balance:.5f} SOL (${self.balance_usd:.2f})")
+
+    def disconnect_wallet(self):
+        with self._lock:
+            self.wallet_address = ""
+            self.connected_once = False
+            self.status = "disconnected"
+            self.sol_balance = 0.0
+            self.balance_usd = 0.0
+            self.signing_available = False
+            self.is_read_only = False
+            self.last_error = ""
+            self._save_session()
+        self._log("Phantom wallet disconnected.")
 
     def _load_session(self):
         if os.path.isfile(self._session_file):
@@ -621,13 +784,18 @@ class PhantomBrowserBridge:
                 "connected_once": self.connected_once,
                 "wallet_address": self.wallet_address,
                 "sol_balance": round(self.sol_balance, 6),
+                "balance_usd": round(self.balance_usd, 2),
+                "gas_reserved_sol": self.gas_reserved_sol,
+                "signing_available": self.signing_available,
+                "is_read_only": self.is_read_only,
+                "rpc_endpoint": self.rpc_endpoint,
                 "auto_confirm": self.auto_confirm,
                 "connection_mode": self.connection_mode,
                 "chrome_profile": self.chrome_profile,
                 "cdp_port": self.cdp_port,
                 "profile_dir": self.profile_dir,
                 "relay_url": f"http://127.0.0.1:{self._relay.port}/phantom-bridge" if self._relay.port else "",
-                "relay_tab_alive": self._relay.is_tab_alive(),
+                "relay_tab_alive": self.is_tab_alive(),
                 "extension_detected": bool(ext_found),
                 "extension_path": ext_found or self.extension_path,
                 "chromium_detected": bool(bin_found),
@@ -639,7 +807,7 @@ class PhantomBrowserBridge:
             }
 
     def is_browser_running(self):
-        if self._relay.is_tab_alive():
+        if self.is_tab_alive():
             return True
         if self._pw_ctx is not None:
             return True
@@ -649,11 +817,18 @@ class PhantomBrowserBridge:
             return bool(self._cdp_targets())
         return False
 
-    def refresh_sol_balance(self, wallet=None):
+    def refresh_sol_balance(self, wallet=None, sol_price_usd=None):
         addr = wallet or self.wallet_address
+        if sol_price_usd and sol_price_usd > 1.0:
+            self.sol_price_usd = float(sol_price_usd)
         if not addr:
             return 0.0
-        body = {"jsonrpc": "2.0", "id": 1, "method": "getBalance", "params": [addr]}
+        body = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getBalance",
+            "params": [addr, {"commitment": "confirmed"}],
+        }
         for rpc in self.rpc_urls:
             try:
                 r = self._http.post(rpc, json=body, timeout=5)
@@ -662,14 +837,16 @@ class PhantomBrowserBridge:
                 val = (r.json().get("result") or {}).get("value")
                 if val is not None:
                     self.sol_balance = float(val) / LAMPORTS_PER_SOL
+                    self.balance_usd = round(self.sol_balance * self.sol_price_usd, 2)
+                    self.rpc_endpoint = rpc
                     self.last_checked_at = time.time()
                     return self.sol_balance
             except Exception:
                 continue
         return self.sol_balance
 
+    # ---------- Browser launch / existing Chrome connection
     def _probe_existing_cdp(self):
-        """Check if user's Chrome is already running with CDP debugging enabled."""
         ports = []
         for p in (self.cdp_port, 9222, 9229):
             if p and p not in ports:
@@ -684,10 +861,6 @@ class PhantomBrowserBridge:
         return None
 
     def _open_url_in_existing_chrome(self, url):
-        """
-        Open `url` in the user's ALREADY-OPEN Chrome browser and chosen profile
-        (e.g. `Default`, `Profile 1`), without creating any new profile.
-        """
         chrome_bin = find_chromium_binary()
         if chrome_bin:
             cmd = [chrome_bin]
@@ -700,16 +873,10 @@ class PhantomBrowserBridge:
             except Exception as e:
                 self._log(f"Direct Chrome tab launch fallback: {e}")
 
-        # Cross-platform fallback opens in user's default browser (existing Chrome window)
         webbrowser.open(url, new=2)
         return True, "Opened bridge tab in default browser"
 
     def launch_persistent_browser(self, open_url="http://127.0.0.1", headless=None):
-        """
-        Used ONLY when `connection_mode == 'isolated_profile'`.
-        Uses installed system Chrome (`channel='chrome'`) or pure-Python CDP
-        so missing Playwright Chromium binaries never trigger errors.
-        """
         with self._lock:
             if self.is_browser_running():
                 return True, f"Browser already running ({self._driver})"
@@ -733,7 +900,6 @@ class PhantomBrowserBridge:
             self.last_error = ""
 
             chrome_bin = find_chromium_binary()
-            # Only use Playwright if system Chrome channel is available (never require `playwright install`)
             if sync_playwright is not None and chrome_bin and not use_headless and platform.system().lower() in ("windows", "darwin"):
                 try:
                     self._pw = sync_playwright().start()
@@ -746,7 +912,6 @@ class PhantomBrowserBridge:
                     self._driver = "playwright"
                     page = self._pw_ctx.pages[0] if self._pw_ctx.pages else self._pw_ctx.new_page()
                     page.goto(open_url, wait_until="domcontentloaded", timeout=20000)
-                    self._log(f"Isolated browser launched via system Chrome ({self.profile_dir})")
                     return True, "Launched isolated Chrome profile"
                 except Exception:
                     self._cleanup_pw()
@@ -795,7 +960,6 @@ class PhantomBrowserBridge:
                     return False, self.last_error
 
                 self._driver = "cdp"
-                self._log(f"Isolated browser launched via pure-Python CDP on port {port}")
                 return True, f"Launched CDP browser (port {port})"
             except Exception as e:
                 self.status = "error"
@@ -812,21 +976,7 @@ class PhantomBrowserBridge:
         except Exception:
             return []
 
-    def _cdp_main_target(self):
-        targets = self._cdp_targets()
-        for t in targets:
-            if t.get("type") == "page" and "phantom-bridge" in str(t.get("url", "")):
-                return t
-        for t in targets:
-            if t.get("type") == "page" and not str(t.get("url", "")).startswith("chrome-extension://"):
-                return t
-        for t in targets:
-            if t.get("type") == "page":
-                return t
-        return None
-
     def _auto_click_phantom_popup_cdp(self, keywords=("Connect", "Approve", "Confirm"), timeout=15.0):
-        """Watch CDP targets for Phantom notification popup and click confirmation button."""
         deadline = time.time() + timeout
         while time.time() < deadline:
             for t in self._cdp_targets():
@@ -860,7 +1010,7 @@ class PhantomBrowserBridge:
                     except Exception:
                         pass
             time.sleep(0.35)
-        return False, "No Phantom confirmation popup clicked before timeout"
+        return False, "No Phantom popup clicked before timeout"
 
     def _auto_click_phantom_popup_pw(self, keywords=("Connect", "Approve", "Confirm"), timeout=15.0):
         if not self._pw_ctx:
@@ -878,42 +1028,38 @@ class PhantomBrowserBridge:
                         except Exception:
                             continue
             time.sleep(0.3)
-        return False, "No Phantom confirmation popup clicked before timeout"
+        return False, "No Phantom popup clicked before timeout"
 
-    def connect_once(self, wait_unlock_sec=45, wallet_hint=""):
+    def connect_once(self, wait_unlock_sec=45, wallet_hint="", dashboard_url=None):
         """
         Browser-Once connection handshake.
-        - `existing_chrome` (default): attaches to already-open Chrome CDP if exposed,
-          otherwise opens the local Python Phantom Bridge tab inside the user's
-          ALREADY-OPEN Chrome browser & chosen profile (no new profile!).
-        - `cdp_attach`: attaches strictly to an existing Chrome CDP port.
-        - `isolated_profile`: opens a separate `phantom_profile/` browser.
+        - If `wallet_hint` is supplied, pairs read-only/RPC address directly.
+        - Otherwise opens the Phantom Bridge tab in the user's already-open Chrome
+          (or attaches via CDP if exposed on `cdp_port`).
         """
         self.last_error = ""
         if wallet_hint and len(wallet_hint.strip()) >= 32:
-            self.wallet_address = wallet_hint.strip()
-            self.connected_once = True
-            self.status = "connected"
-            self.refresh_sol_balance()
-            self._save_session()
-            self._log(f"Phantom paired with wallet {self.wallet_address[:6]}...{self.wallet_address[-4:]}")
-            return True, f"Connected ({self.wallet_address[:6]}...)"
+            self.set_connected_wallet(
+                address=wallet_hint.strip(),
+                signing_available=False,
+                is_read_only=True,
+                driver="manual_address_readonly",
+            )
+            return True, f"Connected read-only address ({self.wallet_address[:6]}...)"
 
-        relay_url = self._relay.url()
+        target_url = dashboard_url or self._relay.url()
 
-        # Mode 1 & 2: Try attaching to already-open Chrome via CDP first
         if self.connection_mode in ("existing_chrome", "cdp_attach"):
             cdp_port = self._probe_existing_cdp()
             if cdp_port is not None:
                 self._cdp_port = cdp_port
                 self._driver = "cdp_attached"
-                # Open our local relay tab inside the already-open Chrome via CDP
                 try:
-                    encoded = urllib.parse.quote(relay_url, safe="")
+                    encoded = urllib.parse.quote(target_url, safe="")
                     self._http.get(f"http://127.0.0.1:{cdp_port}/json/new?{encoded}", timeout=3.0)
                 except Exception:
                     pass
-                self._log(f"Attached directly to already-open Chrome CDP on port {cdp_port}")
+                self._log(f"Attached to already-open Chrome CDP on port {cdp_port}")
                 if self.auto_confirm:
                     threading.Thread(
                         target=self._auto_click_phantom_popup_cdp,
@@ -922,25 +1068,24 @@ class PhantomBrowserBridge:
                     ).start()
                 deadline = time.time() + min(wait_unlock_sec, 18)
                 while time.time() < deadline:
-                    if self.connected_once and self.wallet_address and self._relay.is_tab_alive():
+                    if self.connected_once and self.wallet_address and self.is_tab_alive():
                         return True, f"Connected via existing Chrome CDP: {self.wallet_address}"
                     time.sleep(0.35)
                 self.status = "awaiting_unlock"
-                return False, "Opened bridge tab in existing Chrome (CDP) — click 'Connect' in Phantom once."
+                return False, "Opened bridge tab in existing Chrome (CDP) — approve 'Connect' in Phantom once."
 
             if self.connection_mode == "cdp_attach":
                 self.status = "error"
-                self.last_error = f"No Chrome CDP found on port {self.cdp_port}. Start Chrome with --remote-debugging-port={self.cdp_port} or use 'existing_chrome' mode."
+                self.last_error = f"No Chrome CDP found on port {self.cdp_port}."
                 return False, self.last_error
 
-            # Mode 1 fallback: Open local relay tab right inside the user's already-open Chrome profile!
             self.status = "awaiting_unlock"
             self._driver = "existing_chrome_relay"
-            self._open_url_in_existing_chrome(relay_url)
-            self._log(f"Opened Phantom Bridge tab in your existing Chrome ({self.chrome_profile}): {relay_url}")
+            self._open_url_in_existing_chrome(target_url)
+            self._log(f"Opened Phantom Bridge tab in your existing Chrome ({self.chrome_profile}): {target_url}")
             deadline = time.time() + min(wait_unlock_sec, 20)
             while time.time() < deadline:
-                if self._relay.is_tab_alive() and self.connected_once and self.wallet_address:
+                if self.is_tab_alive() and self.connected_once and self.wallet_address:
                     return True, f"Phantom connected in existing Chrome: {self.wallet_address}"
                 time.sleep(0.4)
             return False, (
@@ -948,8 +1093,7 @@ class PhantomBrowserBridge:
                 "Approve 'Connect' in Phantom once; keep that bridge tab open for Live Mode."
             )
 
-        # Mode 3: Isolated profile
-        ok, msg = self.launch_persistent_browser(open_url=relay_url)
+        ok, msg = self.launch_persistent_browser(open_url=target_url)
         if not ok:
             return False, msg
         self.status = "awaiting_unlock"
@@ -967,13 +1111,14 @@ class PhantomBrowserBridge:
             ).start()
         deadline = time.time() + min(wait_unlock_sec, 20)
         while time.time() < deadline:
-            if self._relay.is_tab_alive() and self.connected_once and self.wallet_address:
+            if self.is_tab_alive() and self.connected_once and self.wallet_address:
                 return True, f"Phantom connected: {self.wallet_address}"
             time.sleep(0.4)
         return False, "Isolated browser opened — unlock Phantom once and approve Connect."
 
-    def fetch_jupiter_swap_tx(self, input_mint, output_mint, amount_raw, slippage_bps=200, user_pubkey=None):
-        """Fetch live Jupiter quote + serialized swap transaction (base64)."""
+    # ---------- Jupiter v6 Swap + On-Chain Parsed Receipt Verification
+    def fetch_jupiter_swap_tx(self, input_mint, output_mint, amount_raw, slippage_bps=150, priority_fee_lamports=50000, user_pubkey=None):
+        """Fetch live Jupiter v6 quote + serialized VersionedTransaction (base64)."""
         pubkey = user_pubkey or self.wallet_address
         if not pubkey:
             return None, "No Phantom wallet address connected."
@@ -991,6 +1136,7 @@ class PhantomBrowserBridge:
                         "outputMint": output_mint,
                         "amount": str(int(amount_raw)),
                         "slippageBps": str(int(slippage_bps)),
+                        "swapMode": "ExactIn",
                     },
                     headers=hdrs,
                     timeout=8,
@@ -1008,7 +1154,7 @@ class PhantomBrowserBridge:
                         "userPublicKey": pubkey,
                         "wrapAndUnwrapSol": True,
                         "dynamicComputeUnitLimit": True,
-                        "prioritizationFeeLamports": "auto",
+                        "prioritizationFeeLamports": priority_fee_lamports,
                     },
                     headers=hdrs,
                     timeout=10,
@@ -1023,10 +1169,18 @@ class PhantomBrowserBridge:
                 continue
         return None, last_err
 
-    def confirm_signature(self, sig, timeout_sec=30.0):
-        """Poll Solana RPC until transaction signature is confirmed or finalized."""
+    def confirm_and_verify_transaction(self, sig, target_mint=None, user_pubkey=None, timeout_sec=35.0):
+        """
+        Poll `getSignatureStatuses` until confirmed/finalized, then inspect
+        `getParsedTransaction` to verify actual SOL spent/received, tokens received,
+        and fee lamports (matching phantomLiveWallet.ts).
+        """
         deadline = time.time() + timeout_sec
-        body = {
+        confirmed = False
+        status_err = None
+        used_rpc = self.rpc_endpoint or self.rpc_urls[0]
+
+        status_body = {
             "jsonrpc": "2.0",
             "id": 1,
             "method": "getSignatureStatuses",
@@ -1035,27 +1189,92 @@ class PhantomBrowserBridge:
         while time.time() < deadline:
             for rpc in self.rpc_urls:
                 try:
-                    r = self._http.post(rpc, json=body, timeout=5)
+                    r = self._http.post(rpc, json=status_body, timeout=5)
                     if r.status_code != 200:
                         continue
                     val = ((r.json().get("result") or {}).get("value") or [None])[0]
                     if isinstance(val, dict):
                         if val.get("err"):
-                            return False, f"On-chain error: {val['err']}"
-                        status = val.get("confirmationStatus")
-                        if status in ("confirmed", "finalized"):
-                            return True, status
+                            return {
+                                "confirmed": False,
+                                "explorer_url": f"https://solscan.io/tx/{sig}",
+                                "error": f"On-chain error: {json.dumps(val['err'])}",
+                            }
+                        st = val.get("confirmationStatus")
+                        if st in ("confirmed", "finalized"):
+                            confirmed = True
+                            used_rpc = rpc
+                            break
                 except Exception:
                     continue
-            time.sleep(1.0)
-        return False, "Confirmation timeout"
+            if confirmed:
+                break
+            time.sleep(1.2)
+
+        if not confirmed:
+            return {
+                "confirmed": False,
+                "explorer_url": f"https://solscan.io/tx/{sig}",
+                "error": status_err or "Transaction confirmation timed out after 35s.",
+            }
+
+        actual_tokens = None
+        actual_sol_spent = None
+        actual_sol_received = None
+        fee_lamports = None
+        pubkey = user_pubkey or self.wallet_address
+
+        parsed_body = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getParsedTransaction",
+            "params": [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0, "commitment": "confirmed"}],
+        }
+        try:
+            r = self._http.post(used_rpc, json=parsed_body, timeout=8)
+            if r.status_code == 200:
+                tx = (r.json().get("result") or {})
+                meta = tx.get("meta") or {}
+                fee_lamports = meta.get("fee")
+                if pubkey and meta:
+                    keys = ((tx.get("transaction") or {}).get("message") or {}).get("accountKeys") or []
+                    key_strs = [k.get("pubkey") if isinstance(k, dict) else str(k) for k in keys]
+                    if pubkey in key_strs:
+                        idx = key_strs.index(pubkey)
+                        pre_b = (meta.get("preBalances") or [])[idx]
+                        post_b = (meta.get("postBalances") or [])[idx]
+                        diff = pre_b - post_b
+                        if diff > 0:
+                            actual_sol_spent = max(0.0, (diff - (fee_lamports or 0)) / LAMPORTS_PER_SOL)
+                        elif diff < 0:
+                            actual_sol_received = abs(diff) / LAMPORTS_PER_SOL
+                    if target_mint:
+                        pre_tok = sum(
+                            float((b.get("uiTokenAmount") or {}).get("uiAmount") or 0)
+                            for b in (meta.get("preTokenBalances") or [])
+                            if b.get("owner") == pubkey and b.get("mint") == target_mint
+                        )
+                        post_tok = sum(
+                            float((b.get("uiTokenAmount") or {}).get("uiAmount") or 0)
+                            for b in (meta.get("postTokenBalances") or [])
+                            if b.get("owner") == pubkey and b.get("mint") == target_mint
+                        )
+                        if post_tok - pre_tok > 0:
+                            actual_tokens = post_tok - pre_tok
+        except Exception:
+            pass
+
+        return {
+            "confirmed": True,
+            "explorer_url": f"https://solscan.io/tx/{sig}",
+            "actual_tokens_received": actual_tokens,
+            "actual_sol_spent": actual_sol_spent,
+            "actual_sol_received": actual_sol_received,
+            "fee_lamports": fee_lamports,
+        }
 
     def _sign_and_send_in_browser(self, tx_b64, side="BUY"):
-        """
-        Sign and send via the open Phantom Bridge relay tab (in existing Chrome or CDP),
-        auto-clicking Phantom's Confirm popup whenever CDP is attached.
-        """
-        if self._relay.is_tab_alive():
+        if self.is_tab_alive():
             if self.auto_confirm and self._cdp_port:
                 threading.Thread(
                     target=self._auto_click_phantom_popup_cdp,
@@ -1068,17 +1287,19 @@ class PhantomBrowserBridge:
                     args=(("Confirm", "Approve"), 25.0),
                     daemon=True,
                 ).start()
-            return self._relay.submit_sign_job(tx_b64, side=side, timeout_sec=45.0)
+            return self.submit_sign_job_to_browser(tx_b64, side=side, timeout_sec=45.0)
 
-        return None, "Phantom Bridge tab is not open in Chrome. Click 'Connect Phantom (Once)' first."
+        return None, "Phantom browser tab is not connected. Click 'Connect Phantom Wallet' in Chrome first."
 
-    def execute_swap(self, side, mint, amount_raw, slippage_bps=200, dry_run=False):
+    def execute_swap(self, side, mint, amount_raw, slippage_bps=150, dry_run=False):
         """
-        Execute a live swap through Jupiter + Phantom Browser-Once automation.
+        Execute a live swap through Jupiter v6 + Phantom browser extension popup.
         """
         with self._lock:
             if not self.connected_once or not self.wallet_address:
-                return {"ok": False, "error": "Phantom is not connected. Click 'Connect Phantom (Once)' first."}
+                return {"ok": False, "error": "Phantom wallet is not connected."}
+            if not dry_run and (self.is_read_only or not self.signing_available):
+                return {"ok": False, "error": "Wallet is read-only; browser signing unavailable."}
 
             input_mint = WSOL_MINT if side.upper() == "BUY" else mint
             output_mint = mint if side.upper() == "BUY" else WSOL_MINT
@@ -1099,6 +1320,7 @@ class PhantomBrowserBridge:
                     "ok": True,
                     "dry_run": True,
                     "signature": f"DRYRUN_{int(time.time())}_{mint[:6]}",
+                    "explorer_url": "",
                     "in_amount": int(quote.get("inAmount", amount_raw)),
                     "out_amount": int(quote.get("outAmount", 0)),
                     "api": swap_pkg["api"],
@@ -1109,10 +1331,15 @@ class PhantomBrowserBridge:
                 self.last_error = send_err or "Phantom signing failed"
                 return {"ok": False, "error": self.last_error}
 
-            confirmed, status_msg = self.confirm_signature(sig, timeout_sec=30.0)
-            if not confirmed:
-                self.last_error = f"Tx {sig}: {status_msg}"
-                return {"ok": False, "signature": sig, "error": self.last_error}
+            verified = self.confirm_and_verify_transaction(sig, target_mint=mint, user_pubkey=self.wallet_address)
+            if not verified.get("confirmed"):
+                self.last_error = verified.get("error") or f"Tx {sig} failed confirmation"
+                return {
+                    "ok": False,
+                    "signature": sig,
+                    "explorer_url": verified.get("explorer_url", f"https://solscan.io/tx/{sig}"),
+                    "error": self.last_error,
+                }
 
             self.last_tx_sig = sig
             self._save_session()
@@ -1121,9 +1348,12 @@ class PhantomBrowserBridge:
                 "ok": True,
                 "dry_run": False,
                 "signature": sig,
+                "explorer_url": verified["explorer_url"],
                 "in_amount": int(quote.get("inAmount", amount_raw)),
                 "out_amount": int(quote.get("outAmount", 0)),
-                "confirmation": status_msg,
+                "actual_tokens_out": verified.get("actual_tokens_received"),
+                "actual_sol_delta": verified.get("actual_sol_spent") or verified.get("actual_sol_received"),
+                "fee_lamports": verified.get("fee_lamports"),
             }
 
     def _cleanup_pw(self):
